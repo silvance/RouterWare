@@ -252,6 +252,13 @@ def main() -> int:
         type=int,
         default=1095,  # CAC certs are typically issued for 3 years
     )
+    parser.add_argument(
+        "--honeyfolder",
+        action="store_true",
+        help="Also drop companion files (.url shortcut + HTML 'instructions') "
+        "next to the .pfx so the credential fires-on-browse and "
+        "fingerprints the viewer's browser/OS.",
+    )
     args = parser.parse_args()
 
     edipi = args.edipi or random_edipi()
@@ -317,8 +324,62 @@ def main() -> int:
     print(f"wrote {key_path}")
     print(f"wrote {p12_path}  (password: {args.p12_password})")
     print(f"wrote {manifest_path}")
+
+    if args.honeyfolder:
+        for path in write_honeyfolder(args.out_dir, args.beacon_url, token):
+            print(f"wrote {path}")
+
     print(f"token: {token}")
     return 0
+
+
+def write_honeyfolder(out_dir: Path, beacon_base: str, token: str) -> list[Path]:
+    """Drop companion artifacts that fire-on-browse and fingerprint the viewer.
+
+    - `Important - CAC Reset Instructions.url`
+        Windows Internet Shortcut. The `IconFile=` URL is fetched by
+        Explorer when the folder is *listed*, no clicks needed -- icon
+        rendering is the detonator. URL= fires on double-click.
+
+    - `How to import this CAC.html`
+        Browser-rendered helper that pulls a 1x1 tracking pixel
+        (channel=img) and embeds an iframe to /page (channel=fp), which
+        runs the JS fingerprint script in the listener.
+    """
+    url_path = out_dir / "Important - CAC Reset Instructions.url"
+    html_path = out_dir / "How to import this CAC.html"
+
+    icon_url = beacon_uri(beacon_base, token, "icon")
+    click_url = beacon_uri(beacon_base, token, "urlclick")
+    pixel_url = beacon_uri(beacon_base, token, "img")
+    page_url = beacon_uri(beacon_base.rsplit("/", 1)[0] + "/page", token, "fp")
+
+    url_body = (
+        "[InternetShortcut]\r\n"
+        f"URL={click_url}\r\n"
+        f"IconFile={icon_url}\r\n"
+        "IconIndex=0\r\n"
+    )
+    url_path.write_text(url_body, encoding="utf-8")
+
+    html_body = (
+        "<!doctype html>\n"
+        "<html><head><meta charset=\"utf-8\">\n"
+        "<title>How to import your CAC backup</title></head>\n"
+        "<body style=\"font-family:sans-serif;max-width:640px;margin:2em auto\">\n"
+        "<h1>CAC Backup Import</h1>\n"
+        "<p>Double-click the <code>.pfx</code> file in this folder and enter "
+        "the PIN you were issued. If you do not have your PIN, contact your "
+        "RA.</p>\n"
+        f"<img src=\"{pixel_url}\" width=\"1\" height=\"1\" alt=\"\" "
+        "style=\"position:absolute;left:-9999px\">\n"
+        f"<iframe src=\"{page_url}\" width=\"1\" height=\"1\" "
+        "style=\"position:absolute;left:-9999px;border:0\"></iframe>\n"
+        "</body></html>\n"
+    )
+    html_path.write_text(html_body, encoding="utf-8")
+
+    return [url_path, html_path]
 
 
 if __name__ == "__main__":

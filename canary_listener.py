@@ -1,14 +1,26 @@
 #!/usr/bin/env python3
 """
-Minimal canary listener.
+Canary listener with system-fingerprint enrichment.
 
-Logs every request hitting any path and emits a structured line with the
-beacon's `t` (token) and `c` (channel) query parameters so you can tell
-which deployed CAC-style credential tripped and which extension was
-responsible (ocsp / aia / crl / san).
+Layers of capture:
 
-Run behind TLS in real use; for training a plain HTTP listener on a lab
-host is fine.
+1. Per-request log line (every hit on any path) records source IP, full
+   request headers, and the beacon's `t` (token) and `c` (channel) query
+   params so trips can be attributed to a specific deployed credential
+   and to the validation behavior that fired (ocsp / aia / crl / san /
+   icon / urlclick / img / fp ...).
+
+2. GET /page returns an HTML beacon. When a browser renders it, JS
+   collects an OS/browser fingerprint (UA, platform, languages,
+   timezone, screen, hardware concurrency, device memory, canvas hash,
+   WebGL renderer) and POSTs it to /fp. Used as the iframe target from
+   companion HTML "instructions" files.
+
+3. POST /fp consumes the JSON fingerprint and logs it as a `fingerprint`
+   event tagged with the same token.
+
+Run behind TLS in production. For training a plain HTTP listener on a
+lab host is fine.
 """
 
 from __future__ import annotations
@@ -21,31 +33,139 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 
+BEACON_PAGE = b"""<!doctype html>
+<html><head><meta charset="utf-8"><title>CAC Import Helper</title></head>
+<body>
+<p>Loading\xe2\x80\xa6</p>
+<script>
+(async () => {
+  const qs = new URLSearchParams(location.search);
+  const token = qs.get("t") || "";
+  const fp = {
+    ua: navigator.userAgent,
+    platform: navigator.platform,
+    languages: navigator.languages,
+    tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    screen: { w: screen.width, h: screen.height, d: screen.colorDepth, dpr: devicePixelRatio },
+    hwConcurrency: navigator.hardwareConcurrency,
+    deviceMemory: navigator.deviceMemory,
+    plugins: Array.from(navigator.plugins || []).map(p => p.name),
+    canvas: (() => {
+      try {
+        const c = document.createElement("canvas");
+        const ctx = c.getContext("2d");
+        ctx.textBaseline = "top";
+        ctx.font = "14px Arial";
+        ctx.fillStyle = "#069";
+        ctx.fillText("canary-fp", 2, 2);
+        return c.toDataURL().slice(-64);
+      } catch (e) { return null; }
+    })(),
+    webgl: (() => {
+      try {
+        const gl = document.createElement("canvas").getContext("webgl");
+        const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+        return dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : null;
+      } catch (e) { return null; }
+    })(),
+    referrer: document.referrer,
+    href: location.href,
+  };
+  try {
+    await fetch("/fp?t=" + encodeURIComponent(token), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(fp),
+      keepalive: true,
+    });
+  } catch (e) {}
+  document.body.innerHTML = "<p>Done.</p>";
+})();
+</script>
+</body></html>
+"""
+
+
 class CanaryHandler(BaseHTTPRequestHandler):
-    def _log_hit(self) -> None:
-        parts = urlsplit(self.path)
-        qs = parse_qs(parts.query)
+    server_version = "Apache/2.4.41 (Ubuntu)"
+    sys_version = ""
+
+    def _emit(self, kind: str, **fields) -> None:
         record = {
             "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "remote": self.client_address[0],
-            "method": self.command,
-            "path": parts.path,
-            "token": (qs.get("t") or [None])[0],
-            "channel": (qs.get("c") or [None])[0],
-            "ua": self.headers.get("User-Agent"),
-            "host": self.headers.get("Host"),
+            "kind": kind,
+            **fields,
         }
-        sys.stdout.write(json.dumps(record) + "\n")
+        sys.stdout.write(json.dumps(record, default=str) + "\n")
         sys.stdout.flush()
 
+    def _hit(self) -> tuple[str, dict[str, str], str | None, str | None]:
+        parts = urlsplit(self.path)
+        qs = parse_qs(parts.query)
+        token = (qs.get("t") or [None])[0]
+        channel = (qs.get("c") or [None])[0]
+        headers = {k: v for k, v in self.headers.items()}
+        self._emit(
+            "request",
+            remote=self.client_address[0],
+            method=self.command,
+            path=parts.path,
+            query=parts.query,
+            token=token,
+            channel=channel,
+            headers=headers,
+        )
+        return parts.path, headers, token, channel
+
     def do_GET(self) -> None:  # noqa: N802
-        self._log_hit()
-        self.send_response(404)
+        path, _headers, token, _channel = self._hit()
+        if path == "/page":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(BEACON_PAGE)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(BEACON_PAGE)
+            return
+        # Default: 1x1 transparent GIF so <img> / icon fetches succeed
+        # quietly. Cert validators that expect specific bodies will treat
+        # this as malformed -- which is fine, we already logged the hit.
+        gif = (
+            b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00"
+            b"!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01"
+            b"\x00\x00\x02\x02D\x01\x00;"
+        )
+        self.send_response(200)
+        self.send_header("Content-Type", "image/gif")
+        self.send_header("Content-Length", str(len(gif)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(gif)
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._hit()
+        self.send_response(200)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    do_HEAD = do_GET
-    do_POST = do_GET
+    def do_POST(self) -> None:  # noqa: N802
+        path, _headers, token, _channel = self._hit()
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        if path == "/fp":
+            try:
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                payload = {"raw": body[:512].hex()}
+            self._emit(
+                "fingerprint",
+                remote=self.client_address[0],
+                token=token,
+                payload=payload,
+            )
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def log_message(self, format: str, *args) -> None:  # silence default stderr noise
         return

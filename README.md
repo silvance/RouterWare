@@ -31,18 +31,46 @@ should look authentic to a casual finder but is harmless if disclosed.
 
 ## How the trip fires
 
-Four extensions in the cert each carry a beacon URL pointing at your
-listener, with a unique token and channel tag baked into the query
-string:
+Two layers of detonation, both attributed to the same per-credential
+`t=<token>` and tagged with a `c=<channel>` so you can tell *what*
+fired.
 
-- **AIA `OCSP`** — followed by anything that performs revocation checks
-- **AIA `caIssuers`** — followed by clients trying to build the chain
-- **CRL distribution point** — followed by CRL-based revocation checks
-- **SAN URI** — followed by some certificate parsers and crawlers
+### Layer 1 — cert-driven (passive)
 
-Whichever path the attacker, scanner, or curious finder takes, your
-listener sees the `t=<token>&c=<channel>` parameters and you know which
-deployed credential and which validation behavior tripped.
+Four extensions in the cert each carry a beacon URL. They fire when
+something tries to *validate or use* the credential:
+
+- **AIA `OCSP`** (`c=ocsp`) — revocation check
+- **AIA `caIssuers`** (`c=aia`) — chain-building fetch
+- **CRL distribution point** (`c=crl`) — CRL-based revocation check
+- **SAN URI** (`c=san`) — followed by some parsers and crawlers
+
+Importing the `.pfx` into a cert store typically isn't enough on its
+own — beaconing waits for the *first use*. To fingerprint the *finder*
+the moment the bundle is opened, use Layer 2.
+
+### Layer 2 — honeyfolder (fire-on-browse, OS+browser fingerprint)
+
+Pass `--honeyfolder` to `generate_cac_canary.py` and you also get:
+
+- **`Important - CAC Reset Instructions.url`** — Windows Internet
+  Shortcut. Its `IconFile=` points at the listener; **Explorer fetches
+  the icon as soon as the folder is listed**, with no clicks. The
+  `URL=` fires on double-click (`c=urlclick`). Hit channel: `c=icon`.
+- **`How to import this CAC.html`** — opens in the user's browser. A
+  hidden 1×1 pixel beacons (`c=img`) and an iframe loads `/page` from
+  the listener (`c=fp`), which runs a JS fingerprint:
+    - User-Agent, platform, languages
+    - IANA timezone
+    - Screen geometry + device pixel ratio
+    - `navigator.hardwareConcurrency` / `deviceMemory`
+    - Plugin list
+    - Canvas + WebGL renderer fingerprint
+  Posted back to `/fp` and logged as a `kind=fingerprint` event.
+
+Every request also logs source IP and full request headers
+(`Accept-Language` is gold for locale, `User-Agent` for OS+browser),
+so even hits that never reach the JS layer carry useful signal.
 
 ## Quickstart
 
@@ -52,14 +80,15 @@ pip install -r requirements.txt
 # 1. Stand up the listener (use a real TLS endpoint in practice)
 python canary_listener.py --port 8080 &
 
-# 2. Mint a credential pointing at it
+# 2. Mint a credential + honeyfolder pointing at it
 python generate_cac_canary.py \
   --beacon-url https://canary.lab.example/cb \
   --last DOE --first JOHN --middle Q \
   --p12-password 'changeme1!' \
+  --honeyfolder \
   --out-dir ./canary-out
 
-# 3. Plant the .pfx (and/or .pem) where you want monitored:
+# 3. Zip ./canary-out and plant it where you want monitored:
 #    - a "Personal" share named like My Documents/CAC Backup/
 #    - a developer's keychain export
 #    - an internal wiki page about "CAC PIN reset procedure"
