@@ -28,6 +28,13 @@ def _trunc(value: str | None, n: int = 80) -> str:
     return value if len(value) <= n else value[: n - 1] + "…"
 
 
+def channel_label(event: dict) -> str:
+    if event.get("kind") == "fingerprint":
+        return "fingerprint"
+    ch = event.get("channel") or "?"
+    return f"{event['role']}/{ch}" if event.get("role") else ch
+
+
 def list_tokens(client, bucket: str, prefix: str) -> list[str]:
     base = f"{prefix.strip('/')}/events/"
     seen: set[str] = set()
@@ -62,21 +69,20 @@ def render_request(event: dict) -> Iterable[str]:
     headers = event.get("headers") or {}
     ua = headers.get("User-Agent", "")
     ts = (event.get("ts") or "?")[11:19]
-    channel = event.get("channel") or "-"
     yield (
-        f"  {ts}  [{channel:11}] "
+        f"  {ts}  [{channel_label(event):14}] "
         f"{(event.get('remote') or '?'):15}  {_trunc(ua, 60)}"
     )
     accept_lang = headers.get("Accept-Language")
     if accept_lang:
-        yield f"                              accept-language: {accept_lang}"
+        yield f"                                 accept-language: {accept_lang}"
 
 
 def render_fingerprint(event: dict) -> Iterable[str]:
     payload = event.get("payload") or {}
     ts = (event.get("ts") or "?")[11:19]
     yield (
-        f"  {ts}  [fingerprint] "
+        f"  {ts}  [fingerprint   ] "
         f"{(event.get('remote') or '?'):15}"
     )
     screen = payload.get("screen") or {}
@@ -111,10 +117,7 @@ def print_timeline(token: str, events: list[dict]) -> None:
     if not events:
         print(f"no events for token {token}")
         return
-    counts = Counter(
-        ("fingerprint" if e.get("kind") == "fingerprint" else (e.get("channel") or "?"))
-        for e in events
-    )
+    counts = Counter(channel_label(e) for e in events)
     first, last = events[0].get("ts", "?"), events[-1].get("ts", "?")
     print(f"token: {token}")
     print(f"events: {len(events)}  first={first}  last={last}")

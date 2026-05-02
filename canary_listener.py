@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Canary listener with system-fingerprint enrichment.
+Canary listener.
 
-Layers of capture:
+Routes path-encoded beacons of shape /v/<token>/[<role>/]<filename>,
+infers the channel from the filename suffix, and emits a structured
+event to every configured sink (stdout always; S3 if --s3-bucket).
 
-1. Per-request log line (every hit on any path) records source IP, full
-   request headers, and the beacon's `t` (token) and `c` (channel) query
-   params so trips can be attributed to a specific deployed credential
-   and to the validation behavior that fired (ocsp / aia / crl / san /
-   icon / urlclick / img / fp ...).
+Channels (recognised by filename):
+  ocsp                                    -> ocsp
+  *.crl                                   -> crl
+  *.p7c, *.p7s                            -> aia
+  *.ico                                   -> icon       (Explorer icon fetch)
+  help                                    -> urlclick   (.url URL= click)
+  *.gif                                   -> img        (HTML pixel)
+  info                                    -> san        (URI SAN)
+  page                                    -> page       (serves HTML beacon)
+  fp                                      -> fp         (POST endpoint for JS fp)
 
-2. GET /page returns an HTML beacon. When a browser renders it, JS
-   collects an OS/browser fingerprint (UA, platform, languages,
-   timezone, screen, hardware concurrency, device memory, canvas hash,
-   WebGL renderer) and POSTs it to /fp. Used as the iframe target from
-   companion HTML "instructions" files.
-
-3. POST /fp consumes the JSON fingerprint and logs it as a `fingerprint`
-   event tagged with the same token.
+When `<role>` is present (id/sig/enc), it identifies which CAC cert
+fired the beacon.
 
 Run behind TLS in production. For training a plain HTTP listener on a
 lab host is fine.
@@ -32,7 +33,7 @@ import sys
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 
 BEACON_PAGE = b"""<!doctype html>
@@ -41,8 +42,6 @@ BEACON_PAGE = b"""<!doctype html>
 <p>Loading\xe2\x80\xa6</p>
 <script>
 (async () => {
-  const qs = new URLSearchParams(location.search);
-  const token = qs.get("t") || "";
   const fp = {
     ua: navigator.userAgent,
     platform: navigator.platform,
@@ -74,7 +73,7 @@ BEACON_PAGE = b"""<!doctype html>
     href: location.href,
   };
   try {
-    await fetch("/fp?t=" + encodeURIComponent(token), {
+    await fetch(location.pathname.replace(/\\/page$/, "/fp"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(fp),
@@ -88,22 +87,65 @@ BEACON_PAGE = b"""<!doctype html>
 """
 
 
+# 1x1 transparent GIF -- bodyless OK for cert/icon validators, harmless
+# fallback for anything else.
+PIXEL_GIF = (
+    b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00"
+    b"!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01"
+    b"\x00\x00\x02\x02D\x01\x00;"
+)
+
+
+def channel_for(filename: str) -> str:
+    """Map the last path segment to a channel name."""
+    if filename == "ocsp":
+        return "ocsp"
+    if filename.endswith(".crl"):
+        return "crl"
+    if filename.endswith((".p7c", ".p7s")):
+        return "aia"
+    if filename.endswith(".ico"):
+        return "icon"
+    if filename == "help":
+        return "urlclick"
+    if filename.endswith(".gif"):
+        return "img"
+    if filename == "info":
+        return "san"
+    if filename == "page":
+        return "page"
+    if filename == "fp":
+        return "fp"
+    return "unknown"
+
+
+def parse_path(path: str) -> tuple[str | None, str | None, str | None]:
+    """
+    Parse /v/<token>/[<role>/]<file>.
+    Returns (token, role, channel); any of them may be None.
+    """
+    parts = path.strip("/").split("/")
+    if len(parts) < 2 or parts[0] != "v":
+        return None, None, None
+    token = parts[1]
+    rest = parts[2:]
+    if not rest:
+        return token, None, None
+    if len(rest) >= 2 and rest[0] in {"id", "sig", "enc"}:
+        return token, rest[0], channel_for(rest[-1])
+    return token, None, channel_for(rest[-1])
+
+
 EventSink = Callable[[dict], None]
 
 
 def make_s3_sink(bucket: str, prefix: str) -> EventSink:
-    """Return a sink that writes each event as a JSON object to S3.
-
-    Credentials come from the standard boto3 chain (env vars,
-    ~/.aws/credentials, instance/task role, SSO). One PUT per event;
-    fine for the volumes a canary listener sees.
-    """
+    """Write each event as a JSON object to s3://bucket/prefix/events/<token>/..."""
     try:
         import boto3
     except ImportError:
         sys.exit(
-            "S3 sink requested but boto3 is not installed. "
-            "Run: pip install boto3"
+            "S3 sink requested but boto3 is not installed. Run: pip install boto3"
         )
     client = boto3.client("s3")
     prefix = prefix.strip("/")
@@ -111,16 +153,10 @@ def make_s3_sink(bucket: str, prefix: str) -> EventSink:
     def sink(event: dict) -> None:
         ts = dt.datetime.now(dt.timezone.utc)
         token = event.get("token") or "unknown"
-        # Token-major layout: a single list_objects under
-        # <prefix>/events/<token>/ enumerates every hit for that token.
-        key_parts = [
-            prefix,
-            "events",
-            str(token),
-            ts.strftime("%Y/%m/%d"),
-            f"{ts.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}.json",
-        ]
-        key = "/".join(p for p in key_parts if p)
+        key = (
+            f"{prefix}/events/{token}/{ts.strftime('%Y/%m/%d')}/"
+            f"{ts.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}.json"
+        )
         try:
             client.put_object(
                 Bucket=bucket,
@@ -128,7 +164,7 @@ def make_s3_sink(bucket: str, prefix: str) -> EventSink:
                 Body=json.dumps(event, default=str).encode("utf-8"),
                 ContentType="application/json",
             )
-        except Exception as exc:  # pragma: no cover -- best-effort archival
+        except Exception as exc:  # best-effort archival
             sys.stderr.write(f"s3 sink error: {exc}\n")
 
     return sink
@@ -153,60 +189,47 @@ class CanaryHandler(BaseHTTPRequestHandler):
         for sink in self.sinks:
             sink(record)
 
-    def _hit(self) -> tuple[str, dict[str, str], str | None, str | None]:
-        parts = urlsplit(self.path)
-        qs = parse_qs(parts.query)
-        token = (qs.get("t") or [None])[0]
-        channel = (qs.get("c") or [None])[0]
-        headers = {k: v for k, v in self.headers.items()}
+    def _log_request(self) -> tuple[str | None, str | None, str | None]:
+        path = urlsplit(self.path).path
+        token, role, channel = parse_path(path)
         self._emit(
             "request",
             remote=self.client_address[0],
             method=self.command,
-            path=parts.path,
-            query=parts.query,
+            path=path,
             token=token,
+            role=role,
             channel=channel,
-            headers=headers,
+            headers={k: v for k, v in self.headers.items()},
         )
-        return parts.path, headers, token, channel
+        return token, role, channel
 
-    def do_GET(self) -> None:  # noqa: N802
-        path, _headers, token, _channel = self._hit()
-        if path == "/page":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(BEACON_PAGE)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(BEACON_PAGE)
-            return
-        # Default: 1x1 transparent GIF so <img> / icon fetches succeed
-        # quietly. Cert validators that expect specific bodies will treat
-        # this as malformed -- which is fine, we already logged the hit.
-        gif = (
-            b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00"
-            b"!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01"
-            b"\x00\x00\x02\x02D\x01\x00;"
-        )
-        self.send_response(200)
-        self.send_header("Content-Type", "image/gif")
-        self.send_header("Content-Length", str(len(gif)))
+    def _send(self, status: int, body: bytes = b"", content_type: str | None = None) -> None:
+        self.send_response(status)
+        if content_type:
+            self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(gif)
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        _token, _role, channel = self._log_request()
+        if channel == "page":
+            self._send(200, BEACON_PAGE, "text/html; charset=utf-8")
+        else:
+            self._send(200, PIXEL_GIF, "image/gif")
 
     def do_HEAD(self) -> None:  # noqa: N802
-        self._hit()
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self._log_request()
+        self._send(200)
 
     def do_POST(self) -> None:  # noqa: N802
-        path, _headers, token, _channel = self._hit()
+        token, _role, channel = self._log_request()
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
-        if path == "/fp":
+        if channel == "fp":
             try:
                 payload = json.loads(body.decode("utf-8") or "{}")
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -217,11 +240,9 @@ class CanaryHandler(BaseHTTPRequestHandler):
                 token=token,
                 payload=payload,
             )
-        self.send_response(204)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self._send(204)
 
-    def log_message(self, format: str, *args) -> None:  # silence default stderr noise
+    def log_message(self, format: str, *args) -> None:  # silence default stderr
         return
 
 
