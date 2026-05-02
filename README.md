@@ -1,23 +1,53 @@
-# CAC-style canary token
+# RouterWare canary toolkit
 
 > **Synthetic deception artifact only.** Generates self-contained
-> CAC-shaped honey credentials for blue-team training and authorized
-> deception engagements. Do **not** plant outside environments you own
-> or have written authorization to test in. Do **not** use the names
-> or EDIPIs of real persons; the generator defaults to synthetic
-> values and you should keep it that way. The artifact is signed by a
-> synthetic CA chain and will not authenticate to real DoD systems by
-> design. If you don't have an authorization document for the
-> environment you're planting in, stop here.
+> CAC-shaped honey credentials and document beacons for blue-team
+> training and authorized deception engagements. Do **not** plant
+> outside environments you own or have written authorization to test
+> in. Do **not** use the names or EDIPIs of real persons; the
+> generator defaults to synthetic values and you should keep it that
+> way. The artifact is signed by a synthetic CA chain and will not
+> authenticate to real DoD systems by design. If you don't have an
+> authorization document for the environment you're planting in,
+> stop here.
 
-A toolkit for generating a deception artifact shaped like a U.S. DoD
-Common Access Card backup folder — as if a careless user exported their
-CAC keys with ActivClient and dropped the result on a fileshare. The
-folder is designed to fingerprint the operator who finds it the moment
-they browse it, well before they get to offline cryptographic analysis.
+The default workflow generates a folder shaped like a U.S. DoD Common
+Access Card backup — as if a careless user exported their CAC keys
+with ActivClient and dropped the result on a fileshare. The folder is
+designed to fingerprint the operator who finds it the moment they
+browse it, well before they get to offline cryptographic analysis.
 
 For blue-team training, honeyfile programs, and authorized internal
 deception engagements (red-team, purple-team).
+
+## Components
+
+Four independent building blocks. The default `generate_cac_canary.py`
+workflow stitches them into a single planted folder, but each beacon
+vector is conceptually separable:
+
+1. **CAC-style credential canary** — three-cert PFX bundle (Identity
+   with `clientAuth + smartcardLogon`, Digital Signature, Encryption)
+   plus a synthetic CA chain that internally validates. Cert
+   validation beacons fire on AIA OCSP, AIA caIssuers, and CRL
+   distribution point fetches.
+2. **DOCX template beacon** (`CAC Reset Procedure.docx`) — minimal
+   Word document whose `attachedTemplate` relationship points at the
+   listener. Word fetches the URL when the document is opened.
+3. **PDF open-action beacon** (`PIN Reset Instructions.pdf`) —
+   minimal PDF with `/OpenAction /URI` pointing at the listener. The
+   reader fetches the URL on document open (modern Acrobat prompts;
+   many users click through).
+4. **Listener + S3 archive + replay tool** —
+   - `canary_listener.py` routes path-encoded beacons (`/v/<token>/...`)
+     and optionally archives to S3.
+   - `read_events.py` pulls events for a token out of S3 and prints a
+     pretty timeline (or NDJSON).
+
+The DOCX and PDF beacons are not currently exposed as standalone
+generators — they ship as honeyfolder companions to the CAC bundle.
+Splitting them out is a small follow-up if you ever need a Word- or
+PDF-only canary without a fake CAC.
 
 ## What it produces
 
