@@ -58,9 +58,12 @@ def fetch_events(client, bucket: str, prefix: str, token: str) -> list[dict]:
     for key in keys:
         body = client.get_object(Bucket=bucket, Key=key)["Body"].read()
         try:
-            events.append(json.loads(body))
+            event = json.loads(body)
         except json.JSONDecodeError:
             sys.stderr.write(f"skip unparseable object: {key}\n")
+            continue
+        event["_s3_key"] = key
+        events.append(event)
     events.sort(key=lambda e: e.get("ts", ""))
     return events
 

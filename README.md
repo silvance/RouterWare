@@ -1,5 +1,15 @@
 # CAC-style canary token
 
+> **Synthetic deception artifact only.** Generates self-contained
+> CAC-shaped honey credentials for blue-team training and authorized
+> deception engagements. Do **not** plant outside environments you own
+> or have written authorization to test in. Do **not** use the names
+> or EDIPIs of real persons; the generator defaults to synthetic
+> values and you should keep it that way. The artifact is signed by a
+> synthetic CA chain and will not authenticate to real DoD systems by
+> design. If you don't have an authorization document for the
+> environment you're planting in, stop here.
+
 A toolkit for generating a deception artifact shaped like a U.S. DoD
 Common Access Card backup folder — as if a careless user exported their
 CAC keys with ActivClient and dropped the result on a fileshare. The
@@ -71,7 +81,6 @@ listener attributes the hit to the specific cert (id/sig/enc):
 | `ocsp`                      | `ocsp`  | OCSP revocation check                  |
 | `DODIDCA-59_IT.p7c`         | `aia`   | AIA caIssuers chain-build fetch        |
 | `DODIDCA59.crl`             | `crl`   | CRL-based revocation check             |
-| `info`                      | `san`   | URI-SAN follow                         |
 
 Importing the `.pfx` into a cert store typically isn't enough on its
 own — these wait for the *first use* of the cert. To fingerprint the

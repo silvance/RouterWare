@@ -13,7 +13,6 @@ Channels (recognised by filename):
   *.ico                                   -> icon       (Explorer icon fetch)
   help                                    -> urlclick   (.url URL= click)
   *.gif                                   -> img        (HTML pixel)
-  info                                    -> san        (URI SAN)
   page                                    -> page       (serves HTML beacon)
   fp                                      -> fp         (POST endpoint for JS fp)
   *.dotx, *.dot, *.docx                   -> tmpl       (Word attachedTemplate)
@@ -112,8 +111,6 @@ def channel_for(filename: str) -> str:
         return "urlclick"
     if filename.endswith(".gif"):
         return "img"
-    if filename == "info":
-        return "san"
     if filename == "page":
         return "page"
     if filename == "fp":
@@ -146,17 +143,29 @@ EventSink = Callable[[dict], None]
 
 
 def make_s3_sink(bucket: str, prefix: str) -> EventSink:
-    """Write each event as a JSON object to s3://bucket/prefix/events/<token>/..."""
+    """Write each event as a JSON object to s3://bucket/prefix/events/<token>/...
+
+    Skips events with channel=unknown so internet scanner traffic on
+    unrecognised paths doesn't pollute the archive. Calls head_bucket
+    at startup to fail fast on credential or bucket-access problems.
+    """
     try:
         import boto3
+        from botocore.exceptions import BotoCoreError, ClientError
     except ImportError:
         sys.exit(
             "S3 sink requested but boto3 is not installed. Run: pip install boto3"
         )
     client = boto3.client("s3")
+    try:
+        client.head_bucket(Bucket=bucket)
+    except (BotoCoreError, ClientError) as exc:
+        sys.exit(f"s3 sink: bucket {bucket!r} not accessible: {exc}")
     prefix = prefix.strip("/")
 
     def sink(event: dict) -> None:
+        if event.get("channel") == "unknown":
+            return
         ts = dt.datetime.now(dt.timezone.utc)
         token = event.get("token") or "unknown"
         key = (
@@ -170,7 +179,7 @@ def make_s3_sink(bucket: str, prefix: str) -> EventSink:
                 Body=json.dumps(event, default=str).encode("utf-8"),
                 ContentType="application/json",
             )
-        except Exception as exc:  # best-effort archival
+        except (BotoCoreError, ClientError) as exc:  # best-effort archival
             sys.stderr.write(f"s3 sink error: {exc}\n")
 
     return sink
@@ -179,6 +188,11 @@ def make_s3_sink(bucket: str, prefix: str) -> EventSink:
 def stdout_sink(event: dict) -> None:
     sys.stdout.write(json.dumps(event, default=str) + "\n")
     sys.stdout.flush()
+
+
+# Cap on POST body size. Real fingerprint payloads are <2 KB; 64 KB
+# leaves headroom while bounding memory use against malicious clients.
+MAX_BODY_BYTES = 65_536
 
 
 class CanaryHandler(BaseHTTPRequestHandler):
@@ -195,20 +209,23 @@ class CanaryHandler(BaseHTTPRequestHandler):
         for sink in self.sinks:
             sink(record)
 
-    def _log_request(self) -> tuple[str | None, str | None, str | None]:
+    def _parse(self) -> tuple[str | None, str | None, str | None, dict]:
         path = urlsplit(self.path).path
         token, role, channel = parse_path(path)
+        return token, role, channel, {k: v for k, v in self.headers.items()}
+
+    def _emit_request(self, channel: str | None, role: str | None,
+                      token: str | None, headers: dict) -> None:
         self._emit(
             "request",
             remote=self.client_address[0],
             method=self.command,
-            path=path,
+            path=urlsplit(self.path).path,
             token=token,
             role=role,
             channel=channel,
-            headers={k: v for k, v in self.headers.items()},
+            headers=headers,
         )
-        return token, role, channel
 
     def _send(self, status: int, body: bytes = b"", content_type: str | None = None) -> None:
         self.send_response(status)
@@ -221,21 +238,40 @@ class CanaryHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802
-        _token, _role, channel = self._log_request()
+        token, role, channel, headers = self._parse()
+        self._emit_request(channel, role, token, headers)
         if channel == "page":
             self._send(200, BEACON_PAGE, "text/html; charset=utf-8")
         else:
             self._send(200, PIXEL_GIF, "image/gif")
 
     def do_HEAD(self) -> None:  # noqa: N802
-        self._log_request()
+        token, role, channel, headers = self._parse()
+        self._emit_request(channel, role, token, headers)
         self._send(200)
 
     def do_POST(self) -> None:  # noqa: N802
-        token, _role, channel = self._log_request()
-        length = int(self.headers.get("Content-Length") or 0)
+        token, role, channel, headers = self._parse()
+        raw_len = self.headers.get("Content-Length")
+        if raw_len is None:
+            self._emit_request(channel, role, token, headers)
+            self._send(411)
+            return
+        try:
+            length = int(raw_len)
+        except ValueError:
+            self._emit_request(channel, role, token, headers)
+            self._send(400)
+            return
+        if length < 0 or length > MAX_BODY_BYTES:
+            self._emit_request(channel, role, token, headers)
+            self._send(413)
+            return
         body = self.rfile.read(length) if length else b""
+
         if channel == "fp":
+            # The fingerprint event is the canonical record for this hit
+            # and includes the headers; skip the duplicate request event.
             try:
                 payload = json.loads(body.decode("utf-8") or "{}")
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -244,8 +280,11 @@ class CanaryHandler(BaseHTTPRequestHandler):
                 "fingerprint",
                 remote=self.client_address[0],
                 token=token,
+                headers=headers,
                 payload=payload,
             )
+        else:
+            self._emit_request(channel, role, token, headers)
         self._send(204)
 
     def log_message(self, format: str, *args) -> None:  # silence default stderr

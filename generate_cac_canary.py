@@ -199,7 +199,7 @@ def build_leaf_cert(
     *,
     role: str,
     subject: x509.Name,
-    issuer_dn: x509.Name,
+    issuer_cert: x509.Certificate,
     leaf_pubkey,
     signing_key,
     edipi: str,
@@ -260,10 +260,15 @@ def build_leaf_cert(
         ]
     )
 
+    issuer_ski = issuer_cert.extensions.get_extension_for_class(
+        x509.SubjectKeyIdentifier
+    ).value
+    aki = x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(issuer_ski)
+
     builder = (
         x509.CertificateBuilder()
         .subject_name(subject)
-        .issuer_name(issuer_dn)
+        .issuer_name(issuer_cert.subject)
         .public_key(leaf_pubkey)
         .serial_number(serial)
         .not_valid_before(not_before)
@@ -278,6 +283,7 @@ def build_leaf_cert(
         .add_extension(
             x509.SubjectKeyIdentifier.from_public_key(leaf_pubkey), critical=False
         )
+        .add_extension(aki, critical=False)
     )
     return builder.sign(private_key=signing_key, algorithm=hashes.SHA256())
 
@@ -287,6 +293,7 @@ def build_synthetic_ca(
     subject_dn: x509.Name,
     issuer_dn: x509.Name,
     public_key,
+    signing_public_key,
     signing_key,
     not_before: dt.datetime,
     not_after: dt.datetime,
@@ -306,6 +313,12 @@ def build_synthetic_ca(
         .add_extension(_ku(key_cert_sign=True, crl_sign=True), critical=True)
         .add_extension(
             x509.SubjectKeyIdentifier.from_public_key(public_key), critical=False
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_subject_key_identifier(
+                x509.SubjectKeyIdentifier.from_public_key(signing_public_key)
+            ),
+            critical=False,
         )
     )
     return builder.sign(private_key=signing_key, algorithm=hashes.SHA256())
@@ -491,6 +504,7 @@ def build_ca_chain(base_date: dt.datetime):
         subject_dn=root_dn,
         issuer_dn=root_dn,
         public_key=root_key.public_key(),
+        signing_public_key=root_key.public_key(),
         signing_key=root_key,
         not_before=base_date - dt.timedelta(days=10 * 365),
         not_after=base_date + dt.timedelta(days=10 * 365),
@@ -500,6 +514,7 @@ def build_ca_chain(base_date: dt.datetime):
         subject_dn=build_intermediate_dn(),
         issuer_dn=root_dn,
         public_key=inter_key.public_key(),
+        signing_public_key=root_key.public_key(),
         signing_key=root_key,
         not_before=base_date - dt.timedelta(days=5 * 365),
         not_after=base_date + dt.timedelta(days=5 * 365),
@@ -530,7 +545,7 @@ def write_role_pfx(
     leaf_cert = build_leaf_cert(
         role=role,
         subject=subject,
-        issuer_dn=inter_cert.subject,
+        issuer_cert=inter_cert,
         leaf_pubkey=leaf_key.public_key(),
         signing_key=inter_key,
         edipi=edipi,
@@ -618,6 +633,12 @@ def main() -> int:
         action="store_true",
         help="Permit --beacon-url to point at a public OOB/canary service.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing manifest. Without this, refusing prevents "
+        "silent loss of a previous run's token/PIN metadata.",
+    )
     args = parser.parse_args()
 
     try:
@@ -632,7 +653,15 @@ def main() -> int:
     if not (pin.isdigit() and 6 <= len(pin) <= 8):
         parser.error("--pin must be 6-8 digits")
     upn = args.upn or f"{edipi}@mil"
+    if len(upn.encode("utf-8")) >= 0x80:
+        parser.error("--upn must be < 128 bytes after UTF-8 encoding")
     token = secrets.token_urlsafe(12)
+
+    manifest_path = args.out_dir.parent / f".{args.out_dir.name}.token.txt"
+    if manifest_path.exists() and not args.force:
+        parser.error(
+            f"manifest already exists: {manifest_path}; use --force to overwrite"
+        )
 
     # Pretend the user exported their CAC 3-9 months ago. All file
     # mtimes will cluster around base_date with light jitter; the PIN
@@ -689,7 +718,6 @@ def main() -> int:
         companion_paths.append(write_pdf_companion(out_dir, args.beacon_url, token))
 
     # Manifest stays OUTSIDE the planted folder -- the operator must never see it.
-    manifest_path = out_dir.parent / f".{out_dir.name}.token.txt"
     cn = f"{args.last.upper()}.{args.first.upper()}.{args.middle.upper()}.{edipi}"
     manifest_path.write_text(
         f"token={token}\n"
