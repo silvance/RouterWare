@@ -108,8 +108,12 @@ AWS_PROFILE=canary python canary_listener.py \
 Each event is appended to stdout *and* written as a JSON object to:
 
 ```
-s3://my-canary-archive/demo/events/<YYYY>/<MM>/<DD>/<token>/<ts>-<rand>.json
+s3://my-canary-archive/demo/events/<token>/<YYYY>/<MM>/<DD>/<ts>-<rand>.json
 ```
+
+Token-major layout: a single `list_objects` under
+`<prefix>/events/<token>/` enumerates every hit for that token, which is
+what the replay tool below relies on.
 
 Credentials come from the standard AWS chain (env vars,
 `~/.aws/credentials`, instance/task role). Bucket policy needs
@@ -135,6 +139,35 @@ Trade-offs vs. the listener:
 For training demos the listener path is the more illustrative one.
 
 [S3 server access logging]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/ServerLogs.html
+
+## Replaying a trip
+
+After a canary fires, pull the timeline from S3:
+
+```sh
+# What tokens have fired at all?
+python read_events.py --bucket my-canary-archive --prefix demo --list-tokens
+
+# Full timeline for a specific token (every channel + parsed JS fingerprint)
+python read_events.py --bucket my-canary-archive --prefix demo \
+  --token Mi7zFWY3kvUZktFb
+
+# Or get the raw events as NDJSON for downstream processing
+python read_events.py --bucket my-canary-archive --prefix demo \
+  --token Mi7zFWY3kvUZktFb --json | jq .
+```
+
+The pretty timeline shows, for each event, the channel that fired
+(`icon`, `urlclick`, `img`, `fp`, `ocsp`, `aia`, `crl`, `san`, or
+`fingerprint` for the parsed JS payload), source IP, a truncated
+User-Agent, and — for fingerprint events — a key/value block with
+platform, locale, timezone, screen geometry, hardware concurrency,
+device memory, plugin list, and canvas/WebGL renderer.
+
+`read_events.py` only needs `s3:ListBucket` (scoped to the right
+prefix) and `s3:GetObject`. Keep the IAM principal that runs it
+separate from the listener's principal — the listener should only
+write, and the analyst tooling should only read.
 
 ## Training scenarios this supports
 

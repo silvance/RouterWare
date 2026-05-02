@@ -111,11 +111,13 @@ def make_s3_sink(bucket: str, prefix: str) -> EventSink:
     def sink(event: dict) -> None:
         ts = dt.datetime.now(dt.timezone.utc)
         token = event.get("token") or "unknown"
+        # Token-major layout: a single list_objects under
+        # <prefix>/events/<token>/ enumerates every hit for that token.
         key_parts = [
             prefix,
             "events",
-            ts.strftime("%Y/%m/%d"),
             str(token),
+            ts.strftime("%Y/%m/%d"),
             f"{ts.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}.json",
         ]
         key = "/".join(p for p in key_parts if p)
