@@ -95,6 +95,47 @@ python generate_cac_canary.py \
 #    - a screenshot in a phishing lure folder
 ```
 
+## Sending hits to S3
+
+Run the listener with `--s3-bucket`:
+
+```sh
+pip install boto3
+AWS_PROFILE=canary python canary_listener.py \
+  --port 8080 --s3-bucket my-canary-archive --s3-prefix demo
+```
+
+Each event is appended to stdout *and* written as a JSON object to:
+
+```
+s3://my-canary-archive/demo/events/<YYYY>/<MM>/<DD>/<token>/<ts>-<rand>.json
+```
+
+Credentials come from the standard AWS chain (env vars,
+`~/.aws/credentials`, instance/task role). Bucket policy needs
+`s3:PutObject` on `<prefix>/events/*`.
+
+### Alternative: skip the listener entirely
+
+You can also point the cert beacons directly at an S3 website endpoint
+(`https://<bucket>.s3.<region>.amazonaws.com/...?t=...&c=...`) and
+enable [S3 server access logging] on the bucket. Every cert-validation
+hit then shows up in the access log bucket with source IP, UA, and the
+full request URI (which carries the token + channel).
+
+Trade-offs vs. the listener:
+
+| | Listener → S3 | Direct → S3 access log |
+|---|---|---|
+| Real-time | yes | no — best-effort delivery, often hours |
+| Captures Layer-2 JS fingerprint | yes | no (no `/page` to render) |
+| Captures full headers | yes | only fields S3 logs (UA, IP, referer, request URI) |
+| Infra to run | a host + TLS cert | none |
+
+For training demos the listener path is the more illustrative one.
+
+[S3 server access logging]: https://docs.aws.amazon.com/AmazonS3/latest/userguide/ServerLogs.html
+
 ## Training scenarios this supports
 
 - **Recognising honeypot creds.** Hand trainees the `.pem` and ask them
@@ -119,3 +160,8 @@ python generate_cac_canary.py \
 - This tool intentionally does **not** sign with any real CA, embed
   EDIPIs of real persons, or attempt to mimic specific living
   individuals. Use synthetic names.
+- The generator refuses `--beacon-url` values pointing at well-known
+  public OOB services (canarytokens.org, webhook.site, interact.sh,
+  oast.fun, requestbin, etc.) so a trainee can't accidentally
+  exfiltrate to a third party. Override with
+  `--allow-public-callback` if you really mean it.

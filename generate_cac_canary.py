@@ -30,12 +30,57 @@ import datetime as dt
 import secrets
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+
+# Hosts that are well-known public out-of-band / canary-hosting services.
+# Refusing them by default prevents a trainee from accidentally pointing
+# their demo at someone else's listener.
+PUBLIC_CANARY_HOSTS = frozenset(
+    {
+        "canarytokens.com",
+        "canarytokens.org",
+        "interact.sh",
+        "oast.fun",
+        "oast.live",
+        "oast.pro",
+        "oast.me",
+        "oast.online",
+        "oast.site",
+        "oastify.com",
+        "requestbin.com",
+        "requestbin.net",
+        "requestcatcher.com",
+        "webhook.site",
+        "pipedream.com",
+        "beeceptor.com",
+        "burpcollaborator.net",
+    }
+)
+
+
+def validate_beacon_url(url: str, allow_public: bool) -> None:
+    parts = urlsplit(url)
+    if parts.scheme not in {"http", "https"}:
+        raise ValueError(f"--beacon-url must be http(s); got {parts.scheme!r}")
+    if not parts.hostname:
+        raise ValueError("--beacon-url must include a hostname")
+    if allow_public:
+        return
+    host = parts.hostname.lower()
+    for blocked in PUBLIC_CANARY_HOSTS:
+        if host == blocked or host.endswith("." + blocked):
+            raise ValueError(
+                f"--beacon-url points at the public service {blocked!r}; "
+                "use a host you control, or pass --allow-public-callback "
+                "if you really mean it."
+            )
 
 
 # CAC identity certs use the DoD PKI naming convention:
@@ -259,7 +304,19 @@ def main() -> int:
         "next to the .pfx so the credential fires-on-browse and "
         "fingerprints the viewer's browser/OS.",
     )
+    parser.add_argument(
+        "--allow-public-callback",
+        action="store_true",
+        help="Permit --beacon-url to point at a public OOB/canary service "
+        "(canarytokens.org, webhook.site, interact.sh, etc.). Off by default "
+        "so a trainee doesn't accidentally exfiltrate to a third party.",
+    )
     args = parser.parse_args()
+
+    try:
+        validate_beacon_url(args.beacon_url, args.allow_public_callback)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     edipi = args.edipi or random_edipi()
     if len(edipi) != 10 or not edipi.isdigit():

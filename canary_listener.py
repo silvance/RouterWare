@@ -29,7 +29,9 @@ import argparse
 import datetime as dt
 import json
 import sys
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Callable
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -86,9 +88,59 @@ BEACON_PAGE = b"""<!doctype html>
 """
 
 
+EventSink = Callable[[dict], None]
+
+
+def make_s3_sink(bucket: str, prefix: str) -> EventSink:
+    """Return a sink that writes each event as a JSON object to S3.
+
+    Credentials come from the standard boto3 chain (env vars,
+    ~/.aws/credentials, instance/task role, SSO). One PUT per event;
+    fine for the volumes a canary listener sees.
+    """
+    try:
+        import boto3
+    except ImportError:
+        sys.exit(
+            "S3 sink requested but boto3 is not installed. "
+            "Run: pip install boto3"
+        )
+    client = boto3.client("s3")
+    prefix = prefix.strip("/")
+
+    def sink(event: dict) -> None:
+        ts = dt.datetime.now(dt.timezone.utc)
+        token = event.get("token") or "unknown"
+        key_parts = [
+            prefix,
+            "events",
+            ts.strftime("%Y/%m/%d"),
+            str(token),
+            f"{ts.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}.json",
+        ]
+        key = "/".join(p for p in key_parts if p)
+        try:
+            client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=json.dumps(event, default=str).encode("utf-8"),
+                ContentType="application/json",
+            )
+        except Exception as exc:  # pragma: no cover -- best-effort archival
+            sys.stderr.write(f"s3 sink error: {exc}\n")
+
+    return sink
+
+
+def stdout_sink(event: dict) -> None:
+    sys.stdout.write(json.dumps(event, default=str) + "\n")
+    sys.stdout.flush()
+
+
 class CanaryHandler(BaseHTTPRequestHandler):
     server_version = "Apache/2.4.41 (Ubuntu)"
     sys_version = ""
+    sinks: list[EventSink] = [stdout_sink]
 
     def _emit(self, kind: str, **fields) -> None:
         record = {
@@ -96,8 +148,8 @@ class CanaryHandler(BaseHTTPRequestHandler):
             "kind": kind,
             **fields,
         }
-        sys.stdout.write(json.dumps(record, default=str) + "\n")
-        sys.stdout.flush()
+        for sink in self.sinks:
+            sink(record)
 
     def _hit(self) -> tuple[str, dict[str, str], str | None, str | None]:
         parts = urlsplit(self.path)
@@ -175,7 +227,26 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument(
+        "--s3-bucket",
+        default=None,
+        help="If set, each event is also archived as a JSON object in this "
+        "bucket. Uses standard AWS credential chain.",
+    )
+    parser.add_argument(
+        "--s3-prefix",
+        default="canary",
+        help="Key prefix inside the bucket (default: canary)",
+    )
     args = parser.parse_args()
+
+    sinks: list[EventSink] = [stdout_sink]
+    if args.s3_bucket:
+        sinks.append(make_s3_sink(args.s3_bucket, args.s3_prefix))
+        sys.stderr.write(
+            f"archiving to s3://{args.s3_bucket}/{args.s3_prefix.strip('/')}/events/...\n"
+        )
+    CanaryHandler.sinks = sinks
 
     server = ThreadingHTTPServer((args.bind, args.port), CanaryHandler)
     sys.stderr.write(f"listening on {args.bind}:{args.port}\n")
