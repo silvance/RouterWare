@@ -210,5 +210,100 @@ class GeneratorEndToEnd(unittest.TestCase):
         self.assertIn("manifest already exists", result.stderr)
 
 
+class StandaloneBeacons(unittest.TestCase):
+    """Standalone DOCX and PDF beacon generators, independent of the CAC bundle."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, script: str, *extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(ROOT / script),
+             "--beacon-url", "https://canary.test.example",
+             *extra],
+            capture_output=True, text=True, check=True,
+        )
+
+    def test_docx_standalone_default(self):
+        out = self.path / "test.docx"
+        result = self._run("generate_docx_beacon.py", "--output", str(out))
+        self.assertTrue(out.exists())
+        with zipfile.ZipFile(out) as zf:
+            rels = zf.read("word/_rels/settings.xml.rels").decode()
+            doc = zf.read("word/document.xml").decode()
+        self.assertIn("attachedTemplate", rels)
+        self.assertIn("template.dotx", rels)
+        self.assertIn("/v/", rels)
+        # Default body text mentions CAC PIN
+        self.assertIn("CAC PIN Reset Procedure", doc)
+        self.assertIn("token:", result.stdout)
+
+    def test_docx_standalone_custom_text(self):
+        out = self.path / "custom.docx"
+        self._run(
+            "generate_docx_beacon.py",
+            "--output", str(out),
+            "--text", "Q3 Strategy\nLine A\nLine B",
+        )
+        with zipfile.ZipFile(out) as zf:
+            doc = zf.read("word/document.xml").decode()
+        self.assertIn("Q3 Strategy", doc)
+        self.assertIn("Line A", doc)
+        self.assertNotIn("CAC PIN Reset", doc)
+
+    def test_pdf_standalone_default(self):
+        out = self.path / "test.pdf"
+        result = self._run("generate_pdf_beacon.py", "--output", str(out))
+        self.assertTrue(out.exists())
+        body = out.read_bytes()
+        self.assertTrue(body.startswith(b"%PDF-1.4"))
+        self.assertIn(b"/OpenAction", body)
+        self.assertIn(b"/URI", body)
+        self.assertIn(b"pdf-open", body)
+        self.assertIn(b"/v/", body)
+        self.assertTrue(body.rstrip().endswith(b"%%EOF"))
+        self.assertIn("token:", result.stdout)
+
+    def test_pdf_standalone_custom_text(self):
+        out = self.path / "custom.pdf"
+        self._run(
+            "generate_pdf_beacon.py",
+            "--output", str(out),
+            "--text", "Compensation Q4\nName: Doe, John\nSalary: $XXX",
+        )
+        body = out.read_bytes()
+        self.assertIn(b"Compensation Q4", body)
+        self.assertIn(b"Doe, John", body)
+        self.assertNotIn(b"CAC PIN Reset", body)
+
+    def test_explicit_token_is_honored(self):
+        out = self.path / "tok.docx"
+        result = self._run(
+            "generate_docx_beacon.py",
+            "--output", str(out),
+            "--token", "deadbeef-token",
+        )
+        self.assertIn("deadbeef-token", result.stdout)
+        with zipfile.ZipFile(out) as zf:
+            rels = zf.read("word/_rels/settings.xml.rels").decode()
+        self.assertIn("/v/deadbeef-token/", rels)
+
+    def test_public_callback_blocked(self):
+        out = self.path / "blocked.docx"
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "generate_docx_beacon.py"),
+             "--beacon-url", "https://x.webhook.site/abc",
+             "--output", str(out)],
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("webhook.site", result.stderr)
+        self.assertFalse(out.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

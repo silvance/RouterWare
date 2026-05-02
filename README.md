@@ -31,23 +31,25 @@ vector is conceptually separable:
    plus a synthetic CA chain that internally validates. Cert
    validation beacons fire on AIA OCSP, AIA caIssuers, and CRL
    distribution point fetches.
-2. **DOCX template beacon** (`CAC Reset Procedure.docx`) — minimal
-   Word document whose `attachedTemplate` relationship points at the
-   listener. Word fetches the URL when the document is opened.
-3. **PDF open-action beacon** (`PIN Reset Instructions.pdf`) —
-   minimal PDF with `/OpenAction /URI` pointing at the listener. The
-   reader fetches the URL on document open (modern Acrobat prompts;
-   many users click through).
+2. **DOCX template beacon** — minimal Word document whose
+   `attachedTemplate` relationship points at the listener. Word
+   fetches the URL when the document is opened. Available as
+   `generate_docx_beacon.py` (standalone, with `--text` for custom
+   body content) and shipped as `CAC Reset Procedure.docx` inside the
+   CAC bundle by default.
+3. **PDF open-action beacon** — minimal PDF with `/OpenAction /URI`
+   pointing at the listener. The reader fetches the URL on document
+   open (modern Acrobat prompts; many users click through). Available
+   as `generate_pdf_beacon.py` (standalone, with `--text`) and
+   shipped as `PIN Reset Instructions.pdf` inside the CAC bundle.
 4. **Listener + S3 archive + replay tool** —
    - `canary_listener.py` routes path-encoded beacons (`/v/<token>/...`)
      and optionally archives to S3.
    - `read_events.py` pulls events for a token out of S3 and prints a
      pretty timeline (or NDJSON).
 
-The DOCX and PDF beacons are not currently exposed as standalone
-generators — they ship as honeyfolder companions to the CAC bundle.
-Splitting them out is a small follow-up if you ever need a Word- or
-PDF-only canary without a fake CAC.
+Shared helpers (URL builders, public-canary blocklist, file writers)
+live in `beacons.py`.
 
 ## What it produces
 
@@ -171,6 +173,35 @@ python generate_cac_canary.py \
 #    - a developer's home directory (Documents/CAC Backup/)
 #    - an internal wiki page that links to the zip
 ```
+
+### Standalone document beacons
+
+The DOCX and PDF beacons can be generated on their own when you don't
+want a fake CAC alongside them — useful for planting in non-CAC
+contexts like an HR share, finance directory, or developer wiki.
+
+```sh
+# DOCX with custom body text
+python generate_docx_beacon.py \
+  --beacon-url https://pki-status.lab.example \
+  --output "./Q3 Strategy.docx" \
+  --text "Q3 Strategy — Confidential
+Revenue targets, cost cuts, and reorg plan.
+For executive review only."
+
+# PDF with custom body text
+python generate_pdf_beacon.py \
+  --beacon-url https://pki-status.lab.example \
+  --output "./Compensation_Q4.pdf" \
+  --text "Compensation Review — Q4
+Name: Doe, John
+Salary: \$XXX,XXX"
+```
+
+Each prints `wrote / token / beacon` on stdout — record the token in
+your deception inventory so you can map a hit back to the deployment
+location. Supply `--token <T>` to reuse an existing token (handy when
+you're planting a coordinated set of artifacts that share attribution).
 
 ## Sending hits to S3
 

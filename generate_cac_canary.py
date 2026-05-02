@@ -38,9 +38,7 @@ import datetime as dt
 import os
 import secrets
 import sys
-import zipfile
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -48,27 +46,13 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-
-PUBLIC_CANARY_HOSTS = frozenset(
-    {
-        "canarytokens.com",
-        "canarytokens.org",
-        "interact.sh",
-        "oast.fun",
-        "oast.live",
-        "oast.pro",
-        "oast.me",
-        "oast.online",
-        "oast.site",
-        "oastify.com",
-        "requestbin.com",
-        "requestbin.net",
-        "requestcatcher.com",
-        "webhook.site",
-        "pipedream.com",
-        "beeceptor.com",
-        "burpcollaborator.net",
-    }
+from beacons import (
+    DEFAULT_DOCX_FILENAME,
+    DEFAULT_PDF_FILENAME,
+    beacon_url,
+    validate_beacon_url,
+    write_docx_beacon,
+    write_pdf_beacon,
 )
 
 
@@ -124,30 +108,6 @@ def random_edipi() -> str:
 
 def random_pin() -> str:
     return "".join(str(secrets.randbelow(10)) for _ in range(6))
-
-
-def validate_beacon_url(url: str, allow_public: bool) -> None:
-    parts = urlsplit(url)
-    if parts.scheme not in {"http", "https"}:
-        raise ValueError(f"--beacon-url must be http(s); got {parts.scheme!r}")
-    if not parts.hostname:
-        raise ValueError("--beacon-url must include a hostname")
-    if allow_public:
-        return
-    host = parts.hostname.lower()
-    for blocked in PUBLIC_CANARY_HOSTS:
-        if host == blocked or host.endswith("." + blocked):
-            raise ValueError(
-                f"--beacon-url points at the public service {blocked!r}; "
-                "use a host you control, or pass --allow-public-callback "
-                "if you really mean it."
-            )
-
-
-def beacon_url(base: str, token: str, *segments: str) -> str:
-    base = base.rstrip("/")
-    suffix = "/".join(segments)
-    return f"{base}/v/{token}/{suffix}"
 
 
 def build_subject(last: str, first: str, middle: str, edipi: str) -> x509.Name:
@@ -365,126 +325,6 @@ def write_honeyfolder(
         encoding="utf-8",
     )
     return [url_path, html_path]
-
-
-def write_docx_companion(out_dir: Path, beacon_base: str, token: str) -> Path:
-    """Write a DOCX whose attachedTemplate points at the listener.
-
-    Word fetches the URL when the document is opened so it can apply
-    the template. Modern Office may show a security warning before
-    fetching; many users click through. Even a blocked fetch attempt
-    can be useful signal at the network layer.
-    """
-    docx_path = out_dir / "CAC Reset Procedure.docx"
-    tmpl_url = beacon_url(beacon_base, token, "template.dotx")
-    parts = {
-        "[Content_Types].xml": (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-            '<Default Extension="xml" ContentType="application/xml"/>'
-            '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
-            '<Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>'
-            "</Types>"
-        ),
-        "_rels/.rels": (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
-            "</Relationships>"
-        ),
-        "word/_rels/document.xml.rels": (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>'
-            "</Relationships>"
-        ),
-        "word/document.xml": (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-            "<w:body>"
-            "<w:p><w:r><w:t>CAC PIN Reset Procedure</w:t></w:r></w:p>"
-            "<w:p><w:r><w:t>1. Insert your CAC into the reader.</w:t></w:r></w:p>"
-            "<w:p><w:r><w:t>2. Launch ActivClient User Console.</w:t></w:r></w:p>"
-            "<w:p><w:r><w:t>3. Select Change PIN from the Tools menu.</w:t></w:r></w:p>"
-            "<w:p><w:r><w:t>4. Enter your old PIN, then your new PIN twice.</w:t></w:r></w:p>"
-            "</w:body>"
-            "</w:document>"
-        ),
-        "word/settings.xml": (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
-            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-            '<w:attachedTemplate r:id="rId1"/>'
-            "</w:settings>"
-        ),
-        "word/_rels/settings.xml.rels": (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-            f'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/attachedTemplate" Target="{tmpl_url}" TargetMode="External"/>'
-            "</Relationships>"
-        ),
-    }
-    with zipfile.ZipFile(docx_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name, content in parts.items():
-            zf.writestr(name, content)
-    return docx_path
-
-
-def _pdf_string(value: str) -> bytes:
-    body = value.encode("utf-8")
-    body = body.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
-    return b"(" + body + b")"
-
-
-def write_pdf_companion(out_dir: Path, beacon_base: str, token: str) -> Path:
-    """Minimal PDF with /OpenAction /URI pointing at the listener.
-
-    Modern Acrobat Reader prompts before fetching external URLs; some
-    third-party PDF viewers and older Reader versions fetch silently.
-    Even a prompt is partial signal at the network layer (DNS resolves
-    on prompt in some clients) and many users click through.
-    """
-    pdf_path = out_dir / "PIN Reset Instructions.pdf"
-    open_url = beacon_url(beacon_base, token, "pdf-open")
-
-    objects: list[bytes] = []
-    objects.append(  # 1: Catalog
-        b"<< /Type /Catalog /Pages 2 0 R "
-        b"/OpenAction << /Type /Action /S /URI /URI " + _pdf_string(open_url) + b" >> >>"
-    )
-    objects.append(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
-    objects.append(
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
-    )
-    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
-    stream = (
-        b"BT /F1 16 Tf 72 720 Td (CAC PIN Reset Procedure) Tj ET\n"
-        b"BT /F1 11 Tf 72 690 Td (1. Insert your CAC into the reader.) Tj ET\n"
-        b"BT /F1 11 Tf 72 672 Td (2. Launch ActivClient User Console.) Tj ET\n"
-        b"BT /F1 11 Tf 72 654 Td (3. Select Change PIN from the Tools menu.) Tj ET\n"
-        b"BT /F1 11 Tf 72 636 Td (4. Enter old PIN, then new PIN twice.) Tj ET\n"
-    )
-    objects.append(
-        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"endstream"
-    )
-
-    out = bytearray(b"%PDF-1.4\n%\xc4\xe5\xf2\xe5\xeb\xa7\xf3\xa0\xd0\xc4\xc6\n")
-    offsets = [0]
-    for i, body in enumerate(objects, start=1):
-        offsets.append(len(out))
-        out += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
-    xref = len(out)
-    out += f"xref\n0 {len(objects) + 1}\n".encode()
-    out += b"0000000000 65535 f \n"
-    for off in offsets[1:]:
-        out += f"{off:010d} 00000 n \n".encode()
-    out += b"trailer\n"
-    out += f"<< /Size {len(objects) + 1} /Root 1 0 R >>\n".encode()
-    out += f"startxref\n{xref}\n%%EOF\n".encode()
-    pdf_path.write_bytes(bytes(out))
-    return pdf_path
 
 
 def build_ca_chain(base_date: dt.datetime):
@@ -714,8 +554,16 @@ def main() -> int:
     companion_paths: list[Path] = []
     if not args.no_companions:
         companion_paths = write_honeyfolder(out_dir, args.beacon_url, token)
-        companion_paths.append(write_docx_companion(out_dir, args.beacon_url, token))
-        companion_paths.append(write_pdf_companion(out_dir, args.beacon_url, token))
+        companion_paths.append(
+            write_docx_beacon(
+                out_dir / DEFAULT_DOCX_FILENAME, args.beacon_url, token
+            )
+        )
+        companion_paths.append(
+            write_pdf_beacon(
+                out_dir / DEFAULT_PDF_FILENAME, args.beacon_url, token
+            )
+        )
 
     # Manifest stays OUTSIDE the planted folder -- the operator must never see it.
     cn = f"{args.last.upper()}.{args.first.upper()}.{args.middle.upper()}.{edipi}"
