@@ -143,11 +143,13 @@ EventSink = Callable[[dict], None]
 
 
 def make_s3_sink(bucket: str, prefix: str) -> EventSink:
-    """Write each event as a JSON object to s3://bucket/prefix/events/<token>/...
+    """Write each event as a JSON object to S3.
 
-    Skips events with channel=unknown so internet scanner traffic on
-    unrecognised paths doesn't pollute the archive. Calls head_bucket
-    at startup to fail fast on credential or bucket-access problems.
+    Known channels go to <prefix>/events/<token>/<date>/...; unrecognised
+    paths (scanner traffic, misconfigured probes) go to
+    <prefix>/unknown/<date>/... so they don't pollute per-token analysis
+    but remain available to analysts. Calls head_bucket at startup to
+    fail fast on credential or bucket-access problems.
     """
     try:
         import boto3
@@ -164,14 +166,13 @@ def make_s3_sink(bucket: str, prefix: str) -> EventSink:
     prefix = prefix.strip("/")
 
     def sink(event: dict) -> None:
-        if event.get("channel") == "unknown":
-            return
         ts = dt.datetime.now(dt.timezone.utc)
-        token = event.get("token") or "unknown"
-        key = (
-            f"{prefix}/events/{token}/{ts.strftime('%Y/%m/%d')}/"
-            f"{ts.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}.json"
-        )
+        suffix = f"{ts.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}.json"
+        if event.get("channel") == "unknown":
+            key = f"{prefix}/unknown/{ts.strftime('%Y/%m/%d')}/{suffix}"
+        else:
+            token = event.get("token") or "unknown"
+            key = f"{prefix}/events/{token}/{ts.strftime('%Y/%m/%d')}/{suffix}"
         try:
             client.put_object(
                 Bucket=bucket,

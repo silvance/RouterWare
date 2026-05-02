@@ -159,6 +159,12 @@ s3://my-canary-archive/demo/events/<token>/<YYYY>/<MM>/<DD>/<ts>-<rand>.json
 Token-major layout: a single `list_objects` under
 `<prefix>/events/<token>/` enumerates every hit for that token.
 
+Internet scanner traffic on unrecognised paths (channel `unknown`) is
+archived separately at `<prefix>/unknown/<YYYY>/<MM>/<DD>/...` so it
+doesn't pollute per-token analysis. Inspect with
+`aws s3 ls s3://<bucket>/<prefix>/unknown/` when you want to see what
+the listener's been probed with.
+
 Credentials come from the standard AWS chain (env vars,
 `~/.aws/credentials`, instance/task role). Bucket policy needs
 `s3:PutObject` on `<prefix>/events/*`.
