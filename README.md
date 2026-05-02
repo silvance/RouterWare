@@ -23,6 +23,8 @@ deception engagements (red-team, purple-team).
 | `pin.txt`                     | The 6-digit PIN, in plaintext (sticky-note style)|
 | `Important - CAC Reset Instructions.url` | Honeyfolder fire-on-browse beacon     |
 | `How to import this CAC.html` | Honeyfolder JS fingerprint beacon                |
+| `CAC Reset Procedure.docx`    | Word `attachedTemplate` beacon (fires on open)   |
+| `PIN Reset Instructions.pdf`  | PDF `/OpenAction /URI` beacon                    |
 
 The manifest (`.<folder>.token.txt`) is written **outside** the planted
 folder so the operator never sees it.
@@ -38,10 +40,12 @@ The certificates carry CAC-shaped metadata:
 - DoD `CertificatePolicies` OID `2.16.840.1.101.2.1.11.39`
 - Validity dates clustered around a random "issue date" 3–9 months ago
 
-The leaves are **self-signed**, not signed by the bundled CA. The
-artifact will not authenticate to any real DoD service — that is the
-safety guarantee. The bundled CA chain is for *visual* completeness in
-Certificate Manager, not cryptographic validation.
+The leaves are signed by the bundled synthetic intermediate, which is
+itself signed by a synthetic root with `CN=DoD Root CA 3`. The chain
+validates internally — `openssl verify -CAfile DoD_CA_Bundle.pem
+<leaf>.cer` succeeds — but the synthetic root is not the real DoD
+root, so the cert will not authenticate to any system that already
+trusts the actual DoD roots. That's the safety guarantee.
 
 ## How the trip fires
 
@@ -73,10 +77,11 @@ Importing the `.pfx` into a cert store typically isn't enough on its
 own — these wait for the *first use* of the cert. To fingerprint the
 *finder* the moment the bundle is opened, see Layer 2.
 
-### Layer 2 — honeyfolder (fire-on-browse, OS+browser fingerprint)
+### Layer 2 — honeyfolder (fire-on-browse / fire-on-open)
 
-Two companion files fire as soon as someone browses the planted folder
-(unless `--no-companions`):
+Four companion files give the operator multiple vectors that beacon
+the moment the folder is browsed or a file is opened (unless
+`--no-companions`):
 
 - **`Important - CAC Reset Instructions.url`** — Windows Internet
   Shortcut. `IconFile=` points at `/v/<token>/icon.ico`; **Explorer
@@ -94,6 +99,16 @@ Two companion files fire as soon as someone browses the planted folder
     - Canvas + WebGL renderer fingerprint
   …and POSTs the result to `/v/<token>/fp`, logged as a
   `kind=fingerprint` event.
+- **`CAC Reset Procedure.docx`** — opens in Word. The DOCX has an
+  `attachedTemplate` relationship pointing at
+  `/v/<token>/template.dotx` (channel `tmpl`). Word fetches the URL
+  to apply the template. Modern Office may show a security warning
+  before fetching; many users click through, and even a blocked fetch
+  often leaves a network-layer signal.
+- **`PIN Reset Instructions.pdf`** — opens in a PDF reader. The PDF's
+  `/OpenAction` is a URI action pointing at `/v/<token>/pdf-open`
+  (channel `pdf`). Modern Acrobat Reader prompts before fetching;
+  some third-party viewers and older Reader versions fetch silently.
 
 Every request also logs source IP and full request headers
 (`Accept-Language` is gold for locale, `User-Agent` for OS+browser),

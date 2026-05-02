@@ -16,6 +16,8 @@ Channels (recognised by filename):
   info                                    -> san        (URI SAN)
   page                                    -> page       (serves HTML beacon)
   fp                                      -> fp         (POST endpoint for JS fp)
+  *.dotx, *.dot, *.docx                   -> tmpl       (Word attachedTemplate)
+  pdf-open, *.pdf                         -> pdf        (PDF /OpenAction /URI)
 
 When `<role>` is present (id/sig/enc), it identifies which CAC cert
 fired the beacon.
@@ -116,6 +118,10 @@ def channel_for(filename: str) -> str:
         return "page"
     if filename == "fp":
         return "fp"
+    if filename.endswith((".dotx", ".dot", ".docx")):
+        return "tmpl"
+    if filename == "pdf-open" or filename.endswith(".pdf"):
+        return "pdf"
     return "unknown"
 
 

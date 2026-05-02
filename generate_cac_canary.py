@@ -38,6 +38,7 @@ import datetime as dt
 import os
 import secrets
 import sys
+import zipfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -353,15 +354,136 @@ def write_honeyfolder(
     return [url_path, html_path]
 
 
-def build_ca_chain(
-    base_date: dt.datetime,
-) -> tuple[x509.Certificate, x509.Certificate]:
+def write_docx_companion(out_dir: Path, beacon_base: str, token: str) -> Path:
+    """Write a DOCX whose attachedTemplate points at the listener.
+
+    Word fetches the URL when the document is opened so it can apply
+    the template. Modern Office may show a security warning before
+    fetching; many users click through. Even a blocked fetch attempt
+    can be useful signal at the network layer.
+    """
+    docx_path = out_dir / "CAC Reset Procedure.docx"
+    tmpl_url = beacon_url(beacon_base, token, "template.dotx")
+    parts = {
+        "[Content_Types].xml": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+            '<Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>'
+            "</Types>"
+        ),
+        "_rels/.rels": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+            "</Relationships>"
+        ),
+        "word/_rels/document.xml.rels": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>'
+            "</Relationships>"
+        ),
+        "word/document.xml": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            "<w:body>"
+            "<w:p><w:r><w:t>CAC PIN Reset Procedure</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>1. Insert your CAC into the reader.</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>2. Launch ActivClient User Console.</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>3. Select Change PIN from the Tools menu.</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>4. Enter your old PIN, then your new PIN twice.</w:t></w:r></w:p>"
+            "</w:body>"
+            "</w:document>"
+        ),
+        "word/settings.xml": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<w:attachedTemplate r:id="rId1"/>'
+            "</w:settings>"
+        ),
+        "word/_rels/settings.xml.rels": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f'<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/attachedTemplate" Target="{tmpl_url}" TargetMode="External"/>'
+            "</Relationships>"
+        ),
+    }
+    with zipfile.ZipFile(docx_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, content in parts.items():
+            zf.writestr(name, content)
+    return docx_path
+
+
+def _pdf_string(value: str) -> bytes:
+    body = value.encode("utf-8")
+    body = body.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+    return b"(" + body + b")"
+
+
+def write_pdf_companion(out_dir: Path, beacon_base: str, token: str) -> Path:
+    """Minimal PDF with /OpenAction /URI pointing at the listener.
+
+    Modern Acrobat Reader prompts before fetching external URLs; some
+    third-party PDF viewers and older Reader versions fetch silently.
+    Even a prompt is partial signal at the network layer (DNS resolves
+    on prompt in some clients) and many users click through.
+    """
+    pdf_path = out_dir / "PIN Reset Instructions.pdf"
+    open_url = beacon_url(beacon_base, token, "pdf-open")
+
+    objects: list[bytes] = []
+    objects.append(  # 1: Catalog
+        b"<< /Type /Catalog /Pages 2 0 R "
+        b"/OpenAction << /Type /Action /S /URI /URI " + _pdf_string(open_url) + b" >> >>"
+    )
+    objects.append(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+    objects.append(
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+    )
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    stream = (
+        b"BT /F1 16 Tf 72 720 Td (CAC PIN Reset Procedure) Tj ET\n"
+        b"BT /F1 11 Tf 72 690 Td (1. Insert your CAC into the reader.) Tj ET\n"
+        b"BT /F1 11 Tf 72 672 Td (2. Launch ActivClient User Console.) Tj ET\n"
+        b"BT /F1 11 Tf 72 654 Td (3. Select Change PIN from the Tools menu.) Tj ET\n"
+        b"BT /F1 11 Tf 72 636 Td (4. Enter old PIN, then new PIN twice.) Tj ET\n"
+    )
+    objects.append(
+        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"endstream"
+    )
+
+    out = bytearray(b"%PDF-1.4\n%\xc4\xe5\xf2\xe5\xeb\xa7\xf3\xa0\xd0\xc4\xc6\n")
+    offsets = [0]
+    for i, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for off in offsets[1:]:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += b"trailer\n"
+    out += f"<< /Size {len(objects) + 1} /Root 1 0 R >>\n".encode()
+    out += f"startxref\n{xref}\n%%EOF\n".encode()
+    pdf_path.write_bytes(bytes(out))
+    return pdf_path
+
+
+def build_ca_chain(base_date: dt.datetime):
     """Synthetic root + intermediate with DoD-shape DNs.
 
     Root self-signs and is valid ~20 years (real DoD roots span similar).
-    Intermediate is signed by root, valid ~10 years. Leaves are NOT
-    signed by the intermediate (would-be #4 on the deception roadmap),
-    so the chain validates internally but no leaf chains to it.
+    Intermediate is signed by root, valid ~10 years. Leaves are signed
+    by the intermediate (so the chain actually validates against the
+    bundled DoD_CA_Bundle.pem -- offline `openssl verify -CAfile` works).
+    The synthetic root is NOT a real DoD root, so the cert won't
+    authenticate to anything that already trusts the real DoD roots --
+    that's the safety story.
     """
     root_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
     root_dn = build_root_dn()
@@ -382,7 +504,7 @@ def build_ca_chain(
         not_before=base_date - dt.timedelta(days=5 * 365),
         not_after=base_date + dt.timedelta(days=5 * 365),
     )
-    return root_cert, inter_cert
+    return root_cert, inter_cert, inter_key
 
 
 def write_role_pfx(
@@ -396,6 +518,7 @@ def write_role_pfx(
     upn: str,
     subject: x509.Name,
     inter_cert: x509.Certificate,
+    inter_key,
     root_cert: x509.Certificate,
     beacon_base: str,
     token: str,
@@ -409,7 +532,7 @@ def write_role_pfx(
         subject=subject,
         issuer_dn=inter_cert.subject,
         leaf_pubkey=leaf_key.public_key(),
-        signing_key=leaf_key,
+        signing_key=inter_key,
         edipi=edipi,
         upn=upn,
         beacon_base=beacon_base,
@@ -523,7 +646,7 @@ def main() -> int:
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    root_cert, inter_cert = build_ca_chain(base_date)
+    root_cert, inter_cert, inter_key = build_ca_chain(base_date)
     subject = build_subject(args.last, args.first, args.middle, edipi)
     surname_lower = args.last.lower()
 
@@ -539,6 +662,7 @@ def main() -> int:
             upn=upn,
             subject=subject,
             inter_cert=inter_cert,
+            inter_key=inter_key,
             root_cert=root_cert,
             beacon_base=args.beacon_url,
             token=token,
@@ -561,6 +685,8 @@ def main() -> int:
     companion_paths: list[Path] = []
     if not args.no_companions:
         companion_paths = write_honeyfolder(out_dir, args.beacon_url, token)
+        companion_paths.append(write_docx_companion(out_dir, args.beacon_url, token))
+        companion_paths.append(write_pdf_companion(out_dir, args.beacon_url, token))
 
     # Manifest stays OUTSIDE the planted folder -- the operator must never see it.
     manifest_path = out_dir.parent / f".{out_dir.name}.token.txt"
