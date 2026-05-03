@@ -259,32 +259,66 @@ python read_events.py --bucket my-canary-archive --prefix demo --token <T>
 python read_events.py --bucket my-canary-archive --prefix demo --token <T> --json | jq .
 ```
 
-Sample timeline from a successful red-team trip:
+Sample timeline from a successful red-team trip (with geo enrichment
+enabled — see below):
 
 ```
 token: 9ZWvvBvh_99_Pi5s
 events: 6  channels: fingerprint=1, icon=1, id/aia=1, id/ocsp=1, img=1, sig/ocsp=1
+sources:
+  10.0.5.42       hits=3 (Tysons Corner, VA, US — Comcast Cable, AS7922)
+  52.94.10.5      hits=2 (Ashburn, VA, US — Amazon.com, AS16509)
+  18.205.99.12    hits=1 (Ashburn, VA, US — Amazon.com, AS14618)
 
   10:25:41  [icon          ] 10.0.5.42        Mozilla/5.0 (Windows NT 10.0; Win64; x64)
-  10:25:42  [img           ] 10.0.5.42        Mozilla/5.0 ... Edg/121.0
-                                 accept-language: en-US,en;q=0.9
+                                 geo: (Tysons Corner, VA, US — Comcast, AS7922)
   10:25:42  [fingerprint   ] 10.0.5.42
+      = Windows 10/11 / Edge 121 / Intel UHD Graphics 630 / 8 cores / 16 GB / en-US / America/Los_Angeles / 1920x1080
       ua                 Mozilla/5.0 ... Edg/121
-      platform           Win32
-      timezone           America/Los_Angeles
-      screen             1920x1080@24 dpr=1.25
-      hw concurrency     8
-      webgl              ANGLE (Intel UHD 630)
+      ... (full key/value detail still rendered below) ...
   11:42:10  [id/ocsp       ] 52.94.10.5       Microsoft-CryptoAPI/10.0
+                                 geo: (Ashburn, VA, US — Amazon.com, AS16509)
   11:42:11  [id/aia        ] 52.94.10.5       Microsoft-CryptoAPI/10.0
-  13:01:00  [sig/ocsp      ] 18.205.x.x       Mozilla/5.0 (Macintosh; Intel Mac OS X 14)
+  13:01:00  [sig/ocsp      ] 18.205.99.12     Mozilla/5.0 (Macintosh; Intel Mac OS X 14)
 ```
 
-Reads: operator browsed the folder on Windows at 10:25 (icon hit, then
-HTML opened — full Windows fingerprint captured), imported the ID cert
-and tried to use it ~80 minutes later (Microsoft CryptoAPI fired
-OCSP+AIA from a different egress IP), and at 13:01 a different host
-(maybe a teammate, maybe pivoted) probed the SIG cert from a Mac.
+Reads: operator browsed the folder on Windows from a Comcast IP in
+Tysons Corner at 10:25 (icon hit, then HTML opened — full Windows
+fingerprint captured, summarised on the `=` line). Imported the ID
+cert and tried to use it ~80 minutes later from an AWS egress
+(Microsoft CryptoAPI fired our OCSP+AIA), and at 13:01 a different
+AWS IP probed the SIG cert from a Mac. Three IPs, three behaviors,
+all linked by the same token.
+
+### Geo enrichment
+
+Pass `--geo-db` and/or `--asn-db` pointing at MaxMind GeoLite2 .mmdb
+files. The replay annotates every source IP with city/region/country
+and ASN/org. GeoLite2 is free with a MaxMind account; install the
+optional dependency with `pip install maxminddb`.
+
+```sh
+python read_events.py --bucket my-canary-archive --prefix demo --token <T> \
+  --geo-db ./GeoLite2-City.mmdb \
+  --asn-db ./GeoLite2-ASN.mmdb
+```
+
+Without the `.mmdb` files (or with `maxminddb` not installed) the
+replay still works and just renders source IPs without geo.
+
+### Fingerprint synthesis
+
+Each `fingerprint` event renders a one-line summary above the full
+key/value detail:
+
+```
+= Windows 10/11 / Edge 121 / Intel UHD Graphics 630 / 8 cores / 16 GB / en-US / America/Los_Angeles / 1920x1080
+```
+
+Built from the existing payload: UA → OS + browser, WebGL renderer
+→ GPU, plus the `hwConcurrency` / `deviceMemory` / `languages` /
+`tz` / `screen` fields. The full key/value block is still printed
+below for the deep dive.
 
 `read_events.py` only needs `s3:ListBucket` (scoped to the prefix) and
 `s3:GetObject`. Keep the IAM principal that runs it separate from the

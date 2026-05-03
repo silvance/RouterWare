@@ -1,3 +1,5 @@
 cryptography>=41.0
 # Optional: only required if you pass --s3-bucket to canary_listener.py
 boto3>=1.28
+# Optional: only required if you pass --geo-db / --asn-db to read_events.py
+maxminddb>=2.0

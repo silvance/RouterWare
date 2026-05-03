@@ -24,6 +24,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import padding
 
 from canary_listener import channel_for, parse_path
+from read_events import _parse_browser, _parse_gpu, _parse_os, synthesize_fingerprint
 
 
 class ListenerRouting(unittest.TestCase):
@@ -303,6 +304,88 @@ class StandaloneBeacons(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("webhook.site", result.stderr)
         self.assertFalse(out.exists())
+
+
+class FingerprintSynthesis(unittest.TestCase):
+    """Pure-function tests for the UA/GPU/hardware synthesis."""
+
+    def test_os_windows(self):
+        ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0")
+        self.assertEqual(_parse_os(ua), "Windows 10/11")
+
+    def test_os_macos(self):
+        ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) "
+              "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15")
+        self.assertEqual(_parse_os(ua), "macOS 14.2")
+
+    def test_os_ios(self):
+        ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X)"
+        self.assertEqual(_parse_os(ua), "iOS 17.2")
+
+    def test_os_android(self):
+        ua = "Mozilla/5.0 (Linux; Android 13; Pixel 7) Chrome/120.0.0.0"
+        self.assertEqual(_parse_os(ua), "Android 13")
+
+    def test_os_linux(self):
+        ua = "Mozilla/5.0 (X11; Linux x86_64) Firefox/121.0"
+        self.assertEqual(_parse_os(ua), "Linux")
+
+    def test_browser_edge_before_chrome(self):
+        # Edge UA contains both "Edg/" and "Chrome/" -- must report Edge.
+        ua = ("Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 "
+              "Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0")
+        self.assertEqual(_parse_browser(ua), "Edge 121")
+
+    def test_browser_chrome(self):
+        ua = "Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 Chrome/120.0.0.0"
+        self.assertEqual(_parse_browser(ua), "Chrome 120")
+
+    def test_browser_firefox(self):
+        ua = "Mozilla/5.0 (X11; Linux x86_64) Firefox/121.0"
+        self.assertEqual(_parse_browser(ua), "Firefox 121")
+
+    def test_browser_safari(self):
+        ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) "
+              "AppleWebKit/605.1.15 Version/17.2 Safari/605.1.15")
+        self.assertEqual(_parse_browser(ua), "Safari 17")
+
+    def test_gpu_angle_d3d(self):
+        webgl = "ANGLE (Intel UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0)"
+        self.assertEqual(_parse_gpu(webgl), "Intel UHD Graphics 630")
+
+    def test_gpu_passthrough(self):
+        self.assertEqual(_parse_gpu("Intel Iris Pro"), "Intel Iris Pro")
+
+    def test_gpu_none(self):
+        self.assertIsNone(_parse_gpu(None))
+
+    def test_synthesize_full(self):
+        payload = {
+            "ua": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0"),
+            "platform": "Win32",
+            "languages": ["en-US", "en"],
+            "tz": "America/Los_Angeles",
+            "screen": {"w": 1920, "h": 1080, "d": 24, "dpr": 1.25},
+            "hwConcurrency": 8,
+            "deviceMemory": 16,
+            "webgl": "ANGLE (Intel UHD Graphics 630 Direct3D11)",
+        }
+        synth = synthesize_fingerprint(payload)
+        self.assertIn("Windows 10/11", synth)
+        self.assertIn("Edge 121", synth)
+        self.assertIn("Intel UHD Graphics 630", synth)
+        self.assertIn("8 cores", synth)
+        self.assertIn("16 GB", synth)
+        self.assertIn("en-US", synth)
+        self.assertIn("America/Los_Angeles", synth)
+        self.assertIn("1920x1080", synth)
+
+    def test_synthesize_minimal(self):
+        # Empty payload should not crash; should return empty or a "?" line.
+        synth = synthesize_fingerprint({})
+        self.assertIsInstance(synth, str)
 
 
 if __name__ == "__main__":
