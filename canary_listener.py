@@ -30,7 +30,9 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import signal
 import sys
+import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
@@ -142,14 +144,29 @@ def parse_path(path: str) -> tuple[str | None, str | None, str | None]:
 EventSink = Callable[[dict], None]
 
 
+def s3_event_path(event: dict, prefix: str) -> str:
+    """S3 path prefix (without date/random suffix) for an event.
+
+    Token-major: events with a parsed token AND a recognised channel
+    go under <prefix>/events/<token>/. Anything else -- scanner
+    traffic on /robots.txt or /.env, unrecognised filenames under
+    /v/<token>/, plain HTTP probes -- goes to <prefix>/unknown/ so it
+    doesn't pollute per-token analysis.
+    """
+    token = event.get("token")
+    channel = event.get("channel")
+    if not token or channel == "unknown":
+        return f"{prefix}/unknown"
+    return f"{prefix}/events/{token}"
+
+
 def make_s3_sink(bucket: str, prefix: str) -> EventSink:
     """Write each event as a JSON object to S3.
 
-    Known channels go to <prefix>/events/<token>/<date>/...; unrecognised
-    paths (scanner traffic, misconfigured probes) go to
-    <prefix>/unknown/<date>/... so they don't pollute per-token analysis
-    but remain available to analysts. Calls head_bucket at startup to
-    fail fast on credential or bucket-access problems.
+    Uses s3_event_path() for routing, so all non-token traffic lands
+    under <prefix>/unknown/<date>/ instead of polluting events/.
+    Calls head_bucket at startup to fail fast on credential or
+    bucket-access problems.
     """
     try:
         import boto3
@@ -168,11 +185,8 @@ def make_s3_sink(bucket: str, prefix: str) -> EventSink:
     def sink(event: dict) -> None:
         ts = dt.datetime.now(dt.timezone.utc)
         suffix = f"{ts.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}.json"
-        if event.get("channel") == "unknown":
-            key = f"{prefix}/unknown/{ts.strftime('%Y/%m/%d')}/{suffix}"
-        else:
-            token = event.get("token") or "unknown"
-            key = f"{prefix}/events/{token}/{ts.strftime('%Y/%m/%d')}/{suffix}"
+        base = s3_event_path(event, prefix)
+        key = f"{base}/{ts.strftime('%Y/%m/%d')}/{suffix}"
         try:
             client.put_object(
                 Bucket=bucket,
@@ -200,6 +214,10 @@ class CanaryHandler(BaseHTTPRequestHandler):
     server_version = "Apache/2.4.41 (Ubuntu)"
     sys_version = ""
     sinks: list[EventSink] = [stdout_sink]
+    # Per-request socket timeout. Slowloris-style attacks tie up
+    # threads if this is None (the default). 30 seconds is generous
+    # for legit cert/AIA fetches and tight enough to bound a thread.
+    timeout = 30
 
     def _emit(self, kind: str, **fields) -> None:
         record = {
@@ -213,7 +231,16 @@ class CanaryHandler(BaseHTTPRequestHandler):
     def _parse(self) -> tuple[str | None, str | None, str | None, dict]:
         path = urlsplit(self.path).path
         token, role, channel = parse_path(path)
-        return token, role, channel, {k: v for k, v in self.headers.items()}
+        # Preserve duplicate headers (matters for proxy chains writing
+        # multiple X-Forwarded-For headers) by joining with ", ", which
+        # is the RFC 7230 equivalent of multiple identical-name headers.
+        headers: dict[str, str] = {}
+        for k, v in self.headers.items():
+            if k in headers:
+                headers[k] = f"{headers[k]}, {v}"
+            else:
+                headers[k] = v
+        return token, role, channel, headers
 
     def _emit_request(self, channel: str | None, role: str | None,
                       token: str | None, headers: dict) -> None:
@@ -319,10 +346,20 @@ def main() -> int:
 
     server = ThreadingHTTPServer((args.bind, args.port), CanaryHandler)
     sys.stderr.write(f"listening on {args.bind}:{args.port}\n")
+
+    def graceful_shutdown(signum, _frame):
+        # server.shutdown() blocks until serve_forever returns and must
+        # be called from a different thread.
+        sys.stderr.write(f"\nsignal {signum} received; draining...\n")
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, graceful_shutdown)
+    signal.signal(signal.SIGINT, graceful_shutdown)
+
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
-        return 0
+    finally:
+        server.server_close()
     return 0
 
 

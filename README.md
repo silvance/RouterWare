@@ -104,9 +104,9 @@ absent for honeyfolder beacons (Layer 2).
 
 ### Layer 1 — cert-driven (passive)
 
-Each cert carries beacon URIs in its AIA, CRL, and SAN extensions. They
-fire when something tries to *validate or use* the credential, and the
-listener attributes the hit to the specific cert (id/sig/enc):
+Each cert carries beacon URIs in its AIA and CRL extensions. They
+fire when something tries to *validate or use* the credential, and
+the listener attributes the hit to the specific cert (id/sig/enc):
 
 | Filename                    | Channel | Trigger                                |
 | --------------------------- | ------- | -------------------------------------- |

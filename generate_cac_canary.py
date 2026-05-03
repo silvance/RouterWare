@@ -21,11 +21,13 @@ on the path, infers the channel from the filename suffix, and tags
 per-cert beacons with the role (id/sig/enc) so you can tell which key
 the operator tried to use.
 
-Self-signed leaves: the leaves are NOT cryptographically chained to
-the bundled CA certs. The bundle is for visual completeness during a
-quick peek -- a deeper offline cryptographic verify still fails. By
-design (#4 in the deception roadmap is intentionally skipped to keep
-the artifact harmless against real DoD services).
+Self-signed CA chain: a synthetic root + intermediate are generated
+per run with DoD-shape DNs (CN=DoD Root CA 3, CN=DOD ID CA-59) and
+the leaves are signed by the intermediate. The chain validates
+against the bundled DoD_CA_Bundle.pem (`openssl verify -CAfile`
+succeeds), but the root is NOT a real DoD root, so the cert won't
+authenticate to anything that already trusts the actual DoD roots.
+That's the safety story.
 
 Authorized internal deception, blue-team training, and red-team
 engagement use only.

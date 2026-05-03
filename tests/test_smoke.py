@@ -9,12 +9,16 @@ cryptography (already required); run with:
 
 from __future__ import annotations
 
+import http.client
 import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,8 +26,10 @@ sys.path.insert(0, str(ROOT))
 
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.serialization import pkcs12
 
-from canary_listener import channel_for, parse_path
+from beacons import validate_beacon_url
+from canary_listener import CanaryHandler, channel_for, parse_path, s3_event_path
 from read_events import _parse_browser, _parse_gpu, _parse_os, synthesize_fingerprint
 
 
@@ -297,7 +303,7 @@ class StandaloneBeacons(unittest.TestCase):
         out = self.path / "blocked.docx"
         result = subprocess.run(
             [sys.executable, str(ROOT / "generate_docx_beacon.py"),
-             "--beacon-url", "https://x.webhook.site/abc",
+             "--beacon-url", "https://x.webhook.site",
              "--output", str(out)],
             capture_output=True, text=True,
         )
@@ -386,6 +392,261 @@ class FingerprintSynthesis(unittest.TestCase):
         # Empty payload should not crash; should return empty or a "?" line.
         synth = synthesize_fingerprint({})
         self.assertIsInstance(synth, str)
+
+
+class S3RoutingPredicate(unittest.TestCase):
+    """Scanner traffic must NOT pollute the per-token event store."""
+
+    def test_token_and_known_channel_routes_to_events(self):
+        self.assertEqual(
+            s3_event_path({"token": "abc", "channel": "page"}, "demo"),
+            "demo/events/abc",
+        )
+
+    def test_unknown_channel_routes_to_unknown(self):
+        # /v/abc/garbage -> token=abc, channel=unknown
+        self.assertEqual(
+            s3_event_path({"token": "abc", "channel": "unknown"}, "demo"),
+            "demo/unknown",
+        )
+
+    def test_no_token_routes_to_unknown(self):
+        # /robots.txt and /.env yield no token at all
+        self.assertEqual(s3_event_path({}, "demo"), "demo/unknown")
+        self.assertEqual(
+            s3_event_path({"token": None, "channel": None}, "demo"),
+            "demo/unknown",
+        )
+
+    def test_no_token_with_some_channel_still_unknown(self):
+        # Defensive: token is the primary attribution; without it,
+        # even a recognised channel (shouldn't happen) goes to unknown.
+        self.assertEqual(
+            s3_event_path({"token": None, "channel": "page"}, "demo"),
+            "demo/unknown",
+        )
+
+
+class BeaconUrlValidation(unittest.TestCase):
+    def test_path_rejected(self):
+        with self.assertRaises(ValueError) as cm:
+            validate_beacon_url("https://h.example/some/path", allow_public=False)
+        self.assertIn("path", str(cm.exception))
+
+    def test_query_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_beacon_url("https://h.example/?foo=bar", allow_public=False)
+
+    def test_fragment_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_beacon_url("https://h.example/#x", allow_public=False)
+
+    def test_bare_slash_path_accepted(self):
+        validate_beacon_url("https://h.example/", allow_public=False)
+
+    def test_no_path_accepted(self):
+        validate_beacon_url("https://h.example", allow_public=False)
+
+
+class CertExtensionURLs(unittest.TestCase):
+    """The cert AIA/CRL URLs must encode token+role+filename correctly."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.bundle_dir = Path(cls._tmp.name) / "CAC Backup"
+        subprocess.run(
+            [sys.executable, str(ROOT / "generate_cac_canary.py"),
+             "--beacon-url", "https://canary.test.example",
+             "--last", "URLCHECK",
+             "--out-dir", str(cls.bundle_dir)],
+            capture_output=True, text=True, check=True,
+        )
+        cls.manifest = (cls.bundle_dir.parent / f".{cls.bundle_dir.name}.token.txt").read_text()
+        m = re.search(r"^token=(\S+)$", cls.manifest, re.M)
+        assert m, f"no token in manifest: {cls.manifest!r}"
+        cls.token = m.group(1)
+        m = re.search(r"^pin=(\d+)$", cls.manifest, re.M)
+        cls.pin = m.group(1)
+        m = re.search(r"^edipi=(\d+)$", cls.manifest, re.M)
+        cls.edipi = m.group(1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def _leaf(self, role: str) -> x509.Certificate:
+        path = self.bundle_dir / f"urlcheck_{self.edipi}_{role}.cer"
+        return x509.load_pem_x509_certificate(path.read_bytes())
+
+    def test_aia_ocsp_url_shape(self):
+        for role in ("id", "sig", "enc"):
+            with self.subTest(role=role):
+                aia = self._leaf(role).extensions.get_extension_for_class(
+                    x509.AuthorityInformationAccess
+                ).value
+                ocsp = next(
+                    ad for ad in aia
+                    if ad.access_method == x509.OID_OCSP
+                )
+                url = ocsp.access_location.value
+                self.assertEqual(
+                    url,
+                    f"https://canary.test.example/v/{self.token}/{role}/ocsp",
+                )
+
+    def test_aia_caissuers_url_shape(self):
+        for role in ("id", "sig", "enc"):
+            with self.subTest(role=role):
+                aia = self._leaf(role).extensions.get_extension_for_class(
+                    x509.AuthorityInformationAccess
+                ).value
+                ca = next(
+                    ad for ad in aia
+                    if ad.access_method == x509.OID_CA_ISSUERS
+                )
+                url = ca.access_location.value
+                self.assertEqual(
+                    url,
+                    f"https://canary.test.example/v/{self.token}/{role}/DODIDCA-59_IT.p7c",
+                )
+
+    def test_crl_url_shape(self):
+        for role in ("id", "sig", "enc"):
+            with self.subTest(role=role):
+                cdp = self._leaf(role).extensions.get_extension_for_class(
+                    x509.CRLDistributionPoints
+                ).value
+                url = cdp[0].full_name[0].value
+                self.assertEqual(
+                    url,
+                    f"https://canary.test.example/v/{self.token}/{role}/DODIDCA59.crl",
+                )
+
+    def test_pfx_loads_with_pin(self):
+        for role in ("id", "sig", "enc"):
+            with self.subTest(role=role):
+                pfx_bytes = (
+                    self.bundle_dir / f"urlcheck_{self.edipi}_{role}.pfx"
+                ).read_bytes()
+                key, cert, additional = pkcs12.load_key_and_certificates(
+                    pfx_bytes, self.pin.encode()
+                )
+                self.assertIsNotNone(key)
+                self.assertIsNotNone(cert)
+                # Bundled CAs should also be present
+                self.assertIsNotNone(additional)
+                self.assertEqual(len(additional), 2)
+
+    def test_pfx_rejects_wrong_pin(self):
+        from cryptography.exceptions import InvalidKey
+        pfx = (self.bundle_dir / f"urlcheck_{self.edipi}_id.pfx").read_bytes()
+        # InvalidKey or ValueError depending on backend; either is correct
+        with self.assertRaises((InvalidKey, ValueError)):
+            pkcs12.load_key_and_certificates(pfx, b"000000")
+
+
+class HttpListenerRoundTrip(unittest.TestCase):
+    """Boot a real server in a thread, hit it, verify events."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._captured: list[dict] = []
+        # Replace sinks to capture in-process; restore on teardown.
+        cls._original_sinks = CanaryHandler.sinks
+        CanaryHandler.sinks = [cls._captured.append]
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), CanaryHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+        CanaryHandler.sinks = cls._original_sinks
+
+    def setUp(self):
+        self._captured.clear()
+
+    def _request(self, method: str, path: str, body: bytes | None = None,
+                 headers: dict | None = None) -> int:
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request(method, path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        return resp.status
+
+    def _wait_for_events(self, n: int, timeout: float = 1.0) -> None:
+        deadline = time.monotonic() + timeout
+        while len(self._captured) < n and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    def test_get_known_channel_logs_request(self):
+        self.assertEqual(self._request("GET", "/v/abc/page"), 200)
+        self._wait_for_events(1)
+        self.assertEqual(len(self._captured), 1)
+        e = self._captured[0]
+        self.assertEqual(e["kind"], "request")
+        self.assertEqual(e["token"], "abc")
+        self.assertEqual(e["channel"], "page")
+
+    def test_per_cert_role_attribution(self):
+        self.assertEqual(self._request("GET", "/v/T/sig/ocsp"), 200)
+        self._wait_for_events(1)
+        e = self._captured[0]
+        self.assertEqual(e["role"], "sig")
+        self.assertEqual(e["channel"], "ocsp")
+
+    def test_robots_txt_has_no_token(self):
+        self.assertEqual(self._request("GET", "/robots.txt"), 200)
+        self._wait_for_events(1)
+        e = self._captured[0]
+        self.assertIsNone(e["token"])
+        # And it must route to unknown for S3
+        self.assertEqual(s3_event_path(e, "p"), "p/unknown")
+
+    def test_post_oversized_returns_413_no_fingerprint(self):
+        status = self._request(
+            "POST", "/v/T/fp",
+            headers={"Content-Length": "99999999"},
+        )
+        self.assertEqual(status, 413)
+        self._wait_for_events(1)
+        # The rejected POST emits a request event but NOT a fingerprint
+        kinds = [e["kind"] for e in self._captured]
+        self.assertIn("request", kinds)
+        self.assertNotIn("fingerprint", kinds)
+
+    def test_post_fingerprint_emits_only_fingerprint_event(self):
+        body = b'{"ua":"X","platform":"Win32"}'
+        status = self._request(
+            "POST", "/v/T/fp",
+            body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+        )
+        self.assertEqual(status, 204)
+        self._wait_for_events(1)
+        kinds = [e["kind"] for e in self._captured]
+        self.assertEqual(kinds, ["fingerprint"])
+        self.assertEqual(self._captured[0]["payload"]["platform"], "Win32")
+
+    def test_duplicate_headers_preserved(self):
+        # Send multiple X-Forwarded-For headers; verify they don't collapse
+        # to last-only. (http.client packs list values as comma-joined.)
+        self._request(
+            "GET", "/v/abc/page",
+            headers={"X-Forwarded-For": "1.1.1.1, 2.2.2.2"},
+        )
+        self._wait_for_events(1)
+        xff = self._captured[0]["headers"].get("X-Forwarded-For", "")
+        self.assertIn("1.1.1.1", xff)
+        self.assertIn("2.2.2.2", xff)
 
 
 if __name__ == "__main__":

@@ -57,12 +57,27 @@ def random_token() -> str:
 
 
 def validate_beacon_url(url: str, allow_public: bool) -> None:
-    """Raise ValueError if url is malformed or points at a public OOB service."""
+    """Raise ValueError if url is malformed or points at a public OOB service.
+
+    Also rejects URLs that include a path/query/fragment because we
+    append `/v/<token>/...` to the base, and a non-empty path or
+    query string in the user input would produce malformed cert
+    extension URLs (e.g. `https://h/x?y=z/v/abc/ocsp`).
+    """
     parts = urlsplit(url)
     if parts.scheme not in {"http", "https"}:
         raise ValueError(f"--beacon-url must be http(s); got {parts.scheme!r}")
     if not parts.hostname:
         raise ValueError("--beacon-url must include a hostname")
+    if parts.path and parts.path != "/":
+        raise ValueError(
+            f"--beacon-url must not include a path; got {parts.path!r}. "
+            "The toolkit appends /v/<token>/... internally."
+        )
+    if parts.query:
+        raise ValueError("--beacon-url must not include a query string")
+    if parts.fragment:
+        raise ValueError("--beacon-url must not include a fragment")
     if allow_public:
         return
     host = parts.hostname.lower()
