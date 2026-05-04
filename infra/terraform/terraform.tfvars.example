@@ -1,0 +1,29 @@
+# Copy to terraform.tfvars and fill in.
+
+bucket_name = "my-canary-archive"
+prefix      = "canary"
+
+# ARNs allowed to assume the writer role. Typical:
+#  - Account root for dev: ["arn:aws:iam::123456789012:root"]
+#  - EC2 instance role:    ["arn:aws:iam::123456789012:role/canary-listener-host"]
+#  - ECS task role:        ["arn:aws:iam::123456789012:role/canary-listener-task"]
+listener_principals = [
+  # "arn:aws:iam::123456789012:role/canary-listener-host",
+]
+
+# ARNs allowed to assume the reader role. Typical:
+#  - SSO permission set:  ["arn:aws:iam::123456789012:role/AWSReservedSSO_SecurityAnalyst_xxx"]
+#  - Specific user role:  ["arn:aws:iam::123456789012:role/security-analyst"]
+analyst_principals = [
+  # "arn:aws:iam::123456789012:role/security-analyst",
+]
+
+# Lifecycle (defaults are fine for most engagements)
+# events_glacier_days = 30
+# events_expire_days  = 365
+# unknown_expire_days = 90
+
+tags = {
+  Project = "RouterWare"
+  Owner   = "blue-team"
+}

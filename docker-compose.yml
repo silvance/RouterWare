@@ -1,0 +1,31 @@
+services:
+  canary-listener:
+    build: .
+    image: routerware-canary-listener:latest
+    restart: unless-stopped
+    ports:
+      - "${LISTENER_PORT:-8080}:8080"
+    environment:
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      # Pass AWS creds via env vars OR mount the host's ~/.aws
+      # (volume below) OR rely on instance/task-level role injection.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+    volumes:
+      # Optional: mount host creds for local dev. Comment out in
+      # production -- use IAM roles instead.
+      - ${HOME}/.aws:/home/canary/.aws:ro
+    command:
+      - --bind=0.0.0.0
+      - --port=8080
+      - --s3-bucket=${CANARY_BUCKET:?set CANARY_BUCKET in .env}
+      - --s3-prefix=${CANARY_PREFIX:-canary}
+      # Uncomment to enable Slack alerting:
+      # - --webhook-url=${SLACK_WEBHOOK}
+      # - --webhook-format=slack
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

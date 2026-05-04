@@ -29,7 +29,14 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import pkcs12
 
 from beacons import validate_beacon_url
-from canary_listener import CanaryHandler, channel_for, parse_path, s3_event_path
+from canary_listener import (
+    CanaryHandler,
+    channel_for,
+    parse_path,
+    s3_event_path,
+    webhook_matches,
+    webhook_payload,
+)
 from read_events import _parse_browser, _parse_gpu, _parse_os, synthesize_fingerprint
 
 
@@ -647,6 +654,102 @@ class HttpListenerRoundTrip(unittest.TestCase):
         xff = self._captured[0]["headers"].get("X-Forwarded-For", "")
         self.assertIn("1.1.1.1", xff)
         self.assertIn("2.2.2.2", xff)
+
+
+class WebhookSink(unittest.TestCase):
+    """Predicate + formatter; the threaded urllib post is verified
+    indirectly via the live HTTP listener test below."""
+
+    def test_default_excludes_unknown_includes_everything_else(self):
+        # No allowlist + don't include unknown
+        self.assertTrue(
+            webhook_matches({"channel": "page", "kind": "request"}, None, False)
+        )
+        self.assertTrue(
+            webhook_matches({"channel": "icon", "kind": "request"}, None, False)
+        )
+        self.assertFalse(
+            webhook_matches({"channel": "unknown", "kind": "request"}, None, False)
+        )
+
+    def test_include_unknown_lets_scanner_through(self):
+        self.assertTrue(
+            webhook_matches({"channel": "unknown", "kind": "request"}, None, True)
+        )
+
+    def test_allowlist_filters(self):
+        ch = {"page", "fingerprint"}
+        self.assertTrue(
+            webhook_matches({"channel": "page", "kind": "request"}, ch, False)
+        )
+        self.assertTrue(
+            webhook_matches({"kind": "fingerprint", "channel": None}, ch, False)
+        )
+        self.assertFalse(
+            webhook_matches({"channel": "icon", "kind": "request"}, ch, False)
+        )
+
+    def test_allowlist_role_qualified(self):
+        # Allowlist entry "id/ocsp" should match a role-qualified hit
+        ch = {"id/ocsp"}
+        self.assertTrue(
+            webhook_matches(
+                {"channel": "ocsp", "role": "id", "kind": "request"}, ch, False
+            )
+        )
+        self.assertFalse(
+            webhook_matches(
+                {"channel": "ocsp", "role": "sig", "kind": "request"}, ch, False
+            )
+        )
+
+    def test_generic_format_returns_event_unchanged(self):
+        event = {"kind": "request", "token": "abc", "remote": "1.1.1.1"}
+        self.assertEqual(webhook_payload(event, "generic"), event)
+
+    def test_slack_format_request_event(self):
+        event = {
+            "kind": "request",
+            "ts": "2026-05-02T10:25:41+00:00",
+            "token": "abc",
+            "remote": "10.0.5.42",
+            "channel": "ocsp",
+            "role": "id",
+            "headers": {"User-Agent": "Microsoft-CryptoAPI/10.0"},
+        }
+        body = webhook_payload(event, "slack")
+        self.assertIn("text", body)
+        text = body["text"]
+        self.assertIn("abc", text)
+        self.assertIn("10.0.5.42", text)
+        self.assertIn("id/ocsp", text)
+        self.assertIn("Microsoft-CryptoAPI", text)
+
+    def test_slack_format_fingerprint_event(self):
+        event = {
+            "kind": "fingerprint",
+            "ts": "2026-05-02T10:25:42+00:00",
+            "token": "abc",
+            "remote": "10.0.5.42",
+            "payload": {
+                "ua": "Mozilla/5.0 (Windows NT 10.0) Edg/121",
+                "tz": "America/Los_Angeles",
+                "screen": {"w": 1920, "h": 1080},
+                "webgl": "ANGLE (Intel UHD Graphics 630 Direct3D11)",
+                "hwConcurrency": 8,
+                "deviceMemory": 16,
+            },
+        }
+        text = webhook_payload(event, "slack")["text"]
+        self.assertIn("fingerprint", text)
+        self.assertIn("America/Los_Angeles", text)
+        self.assertIn("1920x1080", text)
+        self.assertIn("Intel UHD Graphics 630", text)
+        self.assertIn("8 cores, 16 GB", text)
+
+    def test_slack_format_unknown_format_raises(self):
+        with self.assertRaises(ValueError):
+            webhook_payload({}, "smtp")
 
 
 if __name__ == "__main__":

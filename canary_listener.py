@@ -205,6 +205,112 @@ def stdout_sink(event: dict) -> None:
     sys.stdout.flush()
 
 
+# ---- Webhook sink (Slack + generic) --------------------------------------
+
+def webhook_matches(
+    event: dict, channels: set[str] | None, include_unknown: bool
+) -> bool:
+    """Predicate: should this event be forwarded to a webhook?"""
+    ch = event.get("channel")
+    if not include_unknown and ch == "unknown":
+        return False
+    if channels is None:
+        return True
+    kind = event.get("kind")
+    if kind == "fingerprint":
+        return "fingerprint" in channels
+    role = event.get("role")
+    if ch in channels:
+        return True
+    if role and f"{role}/{ch}" in channels:
+        return True
+    return False
+
+
+def webhook_payload(event: dict, fmt: str) -> dict:
+    """Render an event into the webhook body for the chosen format."""
+    if fmt == "generic":
+        return event
+    if fmt != "slack":
+        raise ValueError(f"unknown webhook format: {fmt!r}")
+
+    token = event.get("token") or "?"
+    remote = event.get("remote") or "?"
+    ts = event.get("ts") or "?"
+
+    if event.get("kind") == "fingerprint":
+        p = event.get("payload") or {}
+        screen = p.get("screen") or {}
+        bullets = []
+        ua = p.get("ua")
+        if ua:
+            bullets.append(f"UA: `{ua[:120]}`")
+        if tz := p.get("tz"):
+            bullets.append(f"TZ: `{tz}`")
+        if screen.get("w") and screen.get("h"):
+            bullets.append(f"Screen: `{screen['w']}x{screen['h']}`")
+        if webgl := p.get("webgl"):
+            bullets.append(f"GPU: `{webgl[:80]}`")
+        hw_bits = []
+        if hw := p.get("hwConcurrency"):
+            hw_bits.append(f"{hw} cores")
+        if mem := p.get("deviceMemory"):
+            hw_bits.append(f"{mem} GB")
+        if hw_bits:
+            bullets.append("HW: " + ", ".join(hw_bits))
+        text = (
+            f":rotating_light: *Canary tripped — fingerprint*\n"
+            f"Token `{token}` from `{remote}` at {ts}\n"
+            + "\n".join(bullets)
+        )
+    else:
+        ch = event.get("channel") or "?"
+        role = event.get("role")
+        label = f"{role}/{ch}" if role else ch
+        ua = (event.get("headers") or {}).get("User-Agent", "")
+        text = (
+            f":warning: Canary hit\n"
+            f"Token `{token}` channel `{label}` from `{remote}` at {ts}\n"
+            f"UA: `{ua[:120]}`"
+        )
+    return {"text": text}
+
+
+def make_webhook_sink(
+    url: str,
+    fmt: str = "generic",
+    channels: set[str] | None = None,
+    include_unknown: bool = False,
+) -> EventSink:
+    """Fan out matching events to a webhook URL.
+
+    Each event gets its own daemon thread doing a best-effort POST so a
+    slow webhook doesn't block the request handler.
+    """
+    import urllib.request
+
+    def post(event: dict) -> None:
+        body = json.dumps(
+            webhook_payload(event, fmt), default=str
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5).read()
+        except Exception as exc:  # best-effort
+            sys.stderr.write(f"webhook error: {exc}\n")
+
+    def sink(event: dict) -> None:
+        if not webhook_matches(event, channels, include_unknown):
+            return
+        threading.Thread(target=post, args=(event,), daemon=True).start()
+
+    return sink
+
+
 # Cap on POST body size. Real fingerprint payloads are <2 KB; 64 KB
 # leaves headroom while bounding memory use against malicious clients.
 MAX_BODY_BYTES = 65_536
@@ -334,6 +440,33 @@ def main() -> int:
         default="canary",
         help="Key prefix inside the bucket (default: canary)",
     )
+    parser.add_argument(
+        "--webhook-url",
+        default=None,
+        help="If set, matching events are POSTed to this URL "
+        "(Slack incoming webhook, custom alerting endpoint, etc.).",
+    )
+    parser.add_argument(
+        "--webhook-format",
+        choices=("slack", "generic"),
+        default="generic",
+        help="slack: Slack-shaped {text: ...} message. "
+        "generic: POSTs the raw event JSON. Default: generic.",
+    )
+    parser.add_argument(
+        "--webhook-channels",
+        default=None,
+        help="Comma-separated channel allowlist for the webhook. "
+        "Use either bare channels ('fingerprint,page,tmpl') or "
+        "role-qualified ('id/ocsp'). Default: every channel except "
+        "'unknown'.",
+    )
+    parser.add_argument(
+        "--webhook-include-unknown",
+        action="store_true",
+        help="Forward channel=unknown events to the webhook too. Off by "
+        "default; scanner traffic is noisy.",
+    )
     args = parser.parse_args()
 
     sinks: list[EventSink] = [stdout_sink]
@@ -341,6 +474,21 @@ def main() -> int:
         sinks.append(make_s3_sink(args.s3_bucket, args.s3_prefix))
         sys.stderr.write(
             f"archiving to s3://{args.s3_bucket}/{args.s3_prefix.strip('/')}/events/...\n"
+        )
+    if args.webhook_url:
+        channels: set[str] | None = None
+        if args.webhook_channels:
+            channels = {c.strip() for c in args.webhook_channels.split(",") if c.strip()}
+        sinks.append(
+            make_webhook_sink(
+                args.webhook_url,
+                args.webhook_format,
+                channels,
+                args.webhook_include_unknown,
+            )
+        )
+        sys.stderr.write(
+            f"webhook ({args.webhook_format}) -> {args.webhook_url}\n"
         )
     CanaryHandler.sinks = sinks
 

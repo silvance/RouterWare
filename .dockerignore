@@ -1,0 +1,5 @@
+# Only copy what the listener image actually needs (the COPY in
+# Dockerfile is explicit, but a tight .dockerignore keeps the build
+# context small).
+**
+!canary_listener.py

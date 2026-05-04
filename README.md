@@ -155,6 +155,76 @@ Every request also logs source IP and full request headers
 (`Accept-Language` is gold for locale, `User-Agent` for OS+browser),
 so even hits that never reach the JS layer carry useful signal.
 
+## Deployment
+
+For a real engagement you want the listener running as a long-lived
+service backed by S3 archival, with alerts wired to Slack (or
+similar). The repo ships three pieces for that:
+
+### AWS infrastructure (`infra/terraform/`)
+
+```sh
+cd infra/terraform
+cp terraform.tfvars.example terraform.tfvars
+$EDITOR terraform.tfvars        # bucket_name, listener_principals, analyst_principals
+terraform init && terraform apply
+terraform output bucket_name
+```
+
+Provisions:
+- KMS-encrypted, versioned, public-blocked S3 bucket
+- Lifecycle: events → Glacier IR at 30d, expire at 1y; scanner
+  traffic in `unknown/` expires at 90d
+- Writer role (`s3:PutObject` only) for the listener
+- Reader role (`s3:ListBucket` + `s3:GetObject` on `events/*`) for
+  analyst tooling
+
+See [`infra/terraform/README.md`](infra/terraform/README.md) for
+sizing and trade-off notes.
+
+### Listener container
+
+```sh
+# Build + run with one command
+docker compose up -d
+
+# .env should contain:
+#   CANARY_BUCKET=my-canary-archive
+#   CANARY_PREFIX=canary
+#   AWS_REGION=us-east-1
+#   SLACK_WEBHOOK=https://hooks.slack.com/services/...   (optional)
+```
+
+The image is minimal: Python 3.11 + boto3, runs as a non-root user,
+TCP-level healthcheck (no `/healthz` route — that would be a tell).
+Front it with Caddy / ALB+ACM / Cloudflare for TLS; the listener
+itself binds plain HTTP.
+
+### Alerts (`--webhook-url`)
+
+The listener has a third sink alongside stdout and S3: any URL you
+pass to `--webhook-url` gets a JSON POST per matching event.
+
+```sh
+python canary_listener.py --port 8080 \
+  --s3-bucket my-canary-archive --s3-prefix demo \
+  --webhook-url https://hooks.slack.com/services/T00/B00/XXX \
+  --webhook-format slack
+```
+
+`--webhook-format slack` produces an incoming-webhook-shaped
+`{"text": "..."}` body with the token, source IP, channel, and (for
+fingerprint events) UA + timezone + screen + GPU + hardware in
+bullet form. `--webhook-format generic` POSTs the raw event JSON for
+custom alert pipelines (PagerDuty Events API, your own router, etc.).
+
+By default every channel except `unknown` is forwarded. Tighten with
+`--webhook-channels fingerprint,urlclick,page,id/ocsp` or open up to
+scanner traffic with `--webhook-include-unknown`.
+
+POSTs run on per-event daemon threads with a 5s timeout — a slow
+webhook can't stall the request handler.
+
 ## Quickstart
 
 ```sh
